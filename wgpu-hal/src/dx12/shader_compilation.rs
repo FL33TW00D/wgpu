@@ -96,7 +96,7 @@ mod dxc {
         dxil_path: Option<PathBuf>,
     ) -> Result<Option<DxcContainer>, crate::DeviceError> {
         // Make sure that dxil.dll exists.
-        let dxil = match hassle_rs::Dxil::new(dxil_path) {
+        let dxil = match hassle_rs::Dxil::new(dxil_path.clone()) {
             Ok(dxil) => {
                 log::warn!("Using dxil.dll for DXIL signing.");
                 dxil
@@ -117,7 +117,7 @@ mod dxc {
         // Needed for explicit validation.
         let validator = dxil.create_validator()?;
 
-        let dxc = match hassle_rs::Dxc::new(dxc_path) {
+        let dxc = match hassle_rs::Dxc::new(dxc_path.clone()) {
             Ok(dxc) => dxc,
             Err(e) => {
                 log::warn!(
