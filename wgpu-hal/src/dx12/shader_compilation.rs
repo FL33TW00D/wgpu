@@ -97,9 +97,19 @@ mod dxc {
     ) -> Result<Option<DxcContainer>, crate::DeviceError> {
         // Make sure that dxil.dll exists.
         let dxil = match hassle_rs::Dxil::new(dxil_path) {
-            Ok(dxil) => dxil,
+            Ok(dxil) => {
+                log::warn!("Using dxil.dll for DXIL signing.");
+                dxil
+            }
             Err(e) => {
-                log::warn!("Failed to load dxil.dll. Defaulting to DXC instead: {}", e);
+                log::warn!(
+                    "Failed to load dxil.dll from {}. Defaulting to DXC instead: {}",
+                    dxil_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy())
+                        .unwrap_or_default(),
+                    e
+                );
                 return Ok(None);
             }
         };
@@ -111,7 +121,11 @@ mod dxc {
             Ok(dxc) => dxc,
             Err(e) => {
                 log::warn!(
-                    "Failed to load dxcompiler.dll. Defaulting to FXC instead: {}",
+                    "Failed to load dxcompiler.dll from {}. Defaulting to FXC instead: {}",
+                    dxc_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy())
+                        .unwrap_or_default(),
                     e
                 );
                 return Ok(None);
