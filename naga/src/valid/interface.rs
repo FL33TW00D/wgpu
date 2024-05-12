@@ -180,13 +180,14 @@ impl VaryingContext<'_> {
                     return Err(VaryingError::UnsupportedCapability(required));
                 }
 
-                if matches!(
-                    built_in,
-                    crate::BuiltIn::SubgroupId | crate::BuiltIn::SubgroupInvocationId
-                ) && ep.workgroup_size[1..].iter().any(|&s| s > 1)
-                {
-                    return Err(VaryingError::InvalidMultiDimensionalSubgroupBuiltIn);
-                }
+                //Removed check, this is supported on MSL
+                //if matches!(
+                //    built_in,
+                //    crate::BuiltIn::SubgroupId | crate::BuiltIn::SubgroupInvocationId
+                //) && ep.workgroup_size[1..].iter().any(|&s| s > 1)
+                //{
+                //    return Err(VaryingError::InvalidMultiDimensionalSubgroupBuiltIn);
+                //}
 
                 let (visible, type_good) = match built_in {
                     Bi::BaseInstance | Bi::BaseVertex | Bi::InstanceIndex | Bi::VertexIndex => (
