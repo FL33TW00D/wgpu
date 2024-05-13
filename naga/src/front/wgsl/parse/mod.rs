@@ -2167,6 +2167,42 @@ impl Parser {
         Ok(fun)
     }
 
+    fn global_directive<'a>(
+        &mut self,
+        lexer: &mut Lexer<'a>,
+        out: &mut ast::TranslationUnit<'a>,
+    ) -> Result<(), Error<'a>> {
+        while let Token::Word("enable") = lexer.peek().0 {
+            let (_, enable_span) = lexer.next_ident_with_span()?;
+
+            let mut enable_extension_list = Vec::with_capacity(4);
+            let mut ready = true;
+            while !lexer.skip(Token::Separator(';')) {
+                if !ready {
+                    return Err(Error::Unexpected(
+                        lexer.next().1,
+                        ExpectedToken::Token(Token::Separator(',')),
+                    ));
+                }
+                let (ext, ext_span) = lexer.next_extension_with_span()?;
+                let extension = conv::map_extension(ext, ext_span)?;
+                lexer.add_extension(extension.clone());
+                enable_extension_list.push(extension);
+                ready = lexer.skip(Token::Separator(','));
+            }
+
+            out.directives.append(
+                ast::GlobalDirective {
+                    kind: ast::GlobalDirectiveKind::Enable(ast::EnableDirective {
+                        enable_extension_list,
+                    }),
+                },
+                enable_span,
+            );
+        }
+        Ok(())
+    }
+
     fn global_decl<'a>(
         &mut self,
         lexer: &mut Lexer<'a>,
@@ -2374,6 +2410,7 @@ impl Parser {
 
         let mut lexer = Lexer::new(source);
         let mut tu = ast::TranslationUnit::default();
+        self.global_directive(&mut lexer, &mut tu)?;
         loop {
             match self.global_decl(&mut lexer, &mut tu) {
                 Err(error) => return Err(error),

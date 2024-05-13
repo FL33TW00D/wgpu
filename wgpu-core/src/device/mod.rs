@@ -458,6 +458,7 @@ pub fn create_validator(
         features.contains(wgt::Features::PUSH_CONSTANTS),
     );
     caps.set(Caps::FLOAT64, features.contains(wgt::Features::SHADER_F64));
+    caps.set(Caps::FLOAT16, features.contains(wgt::Features::SHADER_F16));
     caps.set(
         Caps::PRIMITIVE_INDEX,
         features.contains(wgt::Features::SHADER_PRIMITIVE_INDEX),
