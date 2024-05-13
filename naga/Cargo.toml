@@ -25,8 +25,8 @@ dot-out = []
 glsl-in = ["pp-rs"]
 glsl-out = []
 msl-out = []
-serialize = ["serde", "bitflags/serde", "indexmap/serde"]
-deserialize = ["serde", "bitflags/serde", "indexmap/serde"]
+serialize = ["dep:serde", "bitflags/serde", "indexmap/serde", "half/serde"]
+deserialize = ["dep:serde", "bitflags/serde", "indexmap/serde", "half/serde"]
 arbitrary = ["dep:arbitrary", "bitflags/arbitrary", "indexmap/arbitrary"]
 spv-in = ["petgraph", "spirv"]
 spv-out = ["spirv"]
@@ -51,7 +51,6 @@ codespan-reporting = { version = "0.11.0" }
 rustc-hash = "1.1.0"
 indexmap = { version = "2", features = ["std"] }
 log = "0.4"
-num-traits = "0.2"
 spirv = { version = "0.3", optional = true }
 thiserror = "1.0.59"
 serde = { version = "1.0.198", features = ["derive"], optional = true }
@@ -60,6 +59,9 @@ pp-rs = { version = "0.2.1", optional = true }
 hexf-parse = { version = "0.2.1", optional = true }
 unicode-xid = { version = "0.2.3", optional = true }
 arrayvec.workspace = true
+half = { git = "https://github.com/FL33TW00D/half-rs.git",  branch="feature/arbitrary", features=["arbitrary", "num-traits"] }
+num-traits = "0.2"
+smallvec = { workspace = true, features=["const_new"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { version = "0.5", features = [] }

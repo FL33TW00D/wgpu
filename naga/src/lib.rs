@@ -285,6 +285,7 @@ pub use crate::arena::{Arena, Handle, Range, UniqueArena};
 pub use crate::span::{SourceLocation, Span, SpanContext, WithSpan};
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
+use half::f16;
 #[cfg(feature = "deserialize")]
 use serde::Deserialize;
 #[cfg(feature = "serialize")]
@@ -880,6 +881,7 @@ pub enum Literal {
     F64(f64),
     /// May not be NaN or infinity.
     F32(f32),
+    F16(f16),
     U32(u32),
     I32(i32),
     U64(u64),
@@ -967,6 +969,24 @@ pub struct ResourceBinding {
     pub group: u32,
     /// Binding number within the group.
     pub binding: u32,
+}
+
+/// Enable directive
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub enum Extension {
+    F16,
+}
+
+/// Enable directive
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct EnableDirective {
+    extension: Extension,
 }
 
 /// Variable defined at module level.

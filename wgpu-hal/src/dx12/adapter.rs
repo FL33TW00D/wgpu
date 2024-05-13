@@ -348,6 +348,11 @@ impl super::Adapter {
         );
 
         features.set(
+            wgt::Features::SHADER_F16,
+            shader_model >= naga::back::hlsl::ShaderModel::V6_2 && hr == 0,
+        );
+
+        features.set(
             wgt::Features::SUBGROUP,
             shader_model >= naga::back::hlsl::ShaderModel::V6_0
                 && hr == 0
