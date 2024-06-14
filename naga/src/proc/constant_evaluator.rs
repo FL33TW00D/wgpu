@@ -1536,19 +1536,16 @@ impl<'a> ConstantEvaluator<'a> {
                         Literal::AbstractFloat(v) => u64::try_from_abstract(v)?,
                     }),
                     Sc::F16 => Literal::F16(match literal {
-                        //TODO: remove unwraps
                         Literal::F16(v) => v,
                         Literal::F32(v) => f16::from_f32(v),
                         Literal::F64(v) => f16::from_f64(v),
                         Literal::Bool(v) => f16::from_u32(v as u32).unwrap(),
-                        Literal::I64(_)
-                        | Literal::U64(_)
-                        | Literal::U32(_)
-                        | Literal::I32(_)
-                        | Literal::AbstractInt(_) => {
-                            return make_error();
-                        }
+                        Literal::I64(v) => f16::from_i64(v).unwrap(),
+                        Literal::U64(v) => f16::from_u64(v).unwrap(),
+                        Literal::I32(v) => f16::from_i32(v).unwrap(),
+                        Literal::U32(v) => f16::from_u32(v).unwrap(),
                         Literal::AbstractFloat(v) => f16::try_from_abstract(v)?,
+                        Literal::AbstractInt(v) => f16::try_from_abstract(v)?,
                     }),
                     Sc::F32 => Literal::F32(match literal {
                         Literal::I32(v) => v as f32,
@@ -2275,6 +2272,19 @@ impl TryFromAbstract<f64> for f16 {
             });
         }
         Ok(f)
+    }
+}
+
+impl TryFromAbstract<i64> for f16 {
+    fn try_from_abstract(value: i64) -> Result<f16, ConstantEvaluatorError> {
+        let f = f16::from_i64(value);
+        if f.is_none() {
+            return Err(ConstantEvaluatorError::AutomaticConversionLossy {
+                value: format!("{value:?}"),
+                to_type: "f16",
+            });
+        }
+        Ok(f.unwrap())
     }
 }
 
