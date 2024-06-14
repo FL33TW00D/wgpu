@@ -254,7 +254,7 @@ impl super::Validator {
                     true
                 }
                 2 => {
-                    if !self.capabilities.contains(Capabilities::FLOAT16) {
+                    if !self.capabilities.contains(Capabilities::SHADER_FLOAT16) {
                         return Err(WidthError::MissingCapability {
                             name: "f16",
                             flag: "FLOAT16",

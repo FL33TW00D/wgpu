@@ -2167,6 +2167,16 @@ impl Parser {
         Ok(fun)
     }
 
+    fn enable_extension<'a>(
+        &mut self,
+        lexer: &mut Lexer<'a>,
+    ) -> Result<crate::Extension, Error<'a>> {
+        let (ext, ext_span) = lexer.next_extension_with_span()?;
+        let extension = conv::map_extension(ext, ext_span)?;
+        lexer.add_extension(extension.clone());
+        Ok(extension)
+    }
+
     fn global_directive<'a>(
         &mut self,
         lexer: &mut Lexer<'a>,
@@ -2176,27 +2186,29 @@ impl Parser {
             let (_, enable_span) = lexer.next_ident_with_span()?;
 
             let mut enable_extension_list = Vec::with_capacity(4);
-            let mut ready = true;
-            while !lexer.skip(Token::Separator(';')) {
-                if !ready {
-                    return Err(Error::Unexpected(
-                        lexer.next().1,
-                        ExpectedToken::Token(Token::Separator(',')),
-                    ));
-                }
-                let (ext, ext_span) = lexer.next_extension_with_span()?;
-                let extension = conv::map_extension(ext, ext_span)?;
-                lexer.add_extension(extension.clone());
+
+            // Parse the first extension
+            let extension = self.enable_extension(lexer)?;
+            enable_extension_list.push(extension);
+
+            // Parse additional extensions separated by commas
+            while lexer.skip(Token::Separator(',')) {
+                let extension = self.enable_extension(lexer)?;
                 enable_extension_list.push(extension);
-                ready = lexer.skip(Token::Separator(','));
+            }
+
+            // Require a semicolon at the end
+            if !lexer.skip(Token::Separator(';')) {
+                return Err(Error::Unexpected(
+                    lexer.next().1,
+                    ExpectedToken::Token(Token::Separator(';')),
+                ));
             }
 
             out.directives.append(
-                ast::GlobalDirective {
-                    kind: ast::GlobalDirectiveKind::Enable(ast::EnableDirective {
-                        enable_extension_list,
-                    }),
-                },
+                ast::GlobalDirective::Enable(ast::EnableDirective {
+                    enable_extension_list,
+                }),
                 enable_span,
             );
         }

@@ -1491,8 +1491,9 @@ impl<'a> ConstantEvaluator<'a> {
                         Literal::I32(v) => v,
                         Literal::U32(v) => v as i32,
                         Literal::F32(v) => v as i32,
+                        Literal::F16(v) => f16::to_i32(&v).unwrap(), //Only None on NaN or Inf
                         Literal::Bool(v) => v as i32,
-                        Literal::F64(_) | Literal::I64(_) | Literal::U64(_) | Literal::F16(_) => {
+                        Literal::F64(_) | Literal::I64(_) | Literal::U64(_) => {
                             return make_error();
                         }
                         Literal::AbstractInt(v) => i32::try_from_abstract(v)?,
@@ -1502,8 +1503,9 @@ impl<'a> ConstantEvaluator<'a> {
                         Literal::I32(v) => v as u32,
                         Literal::U32(v) => v,
                         Literal::F32(v) => v as u32,
+                        Literal::F16(v) => f16::to_u32(&v).unwrap(), //Only None on NaN or Inf
                         Literal::Bool(v) => v as u32,
-                        Literal::F64(_) | Literal::I64(_) | Literal::U64(_) | Literal::F16(_) => {
+                        Literal::F64(_) | Literal::I64(_) | Literal::U64(_) => {
                             return make_error();
                         }
                         Literal::AbstractInt(v) => u32::try_from_abstract(v)?,
@@ -1517,11 +1519,7 @@ impl<'a> ConstantEvaluator<'a> {
                         Literal::F64(v) => v as i64,
                         Literal::I64(v) => v,
                         Literal::U64(v) => v as i64,
-                        Literal::F16(v) => f16::to_i64(&v).ok_or(
-                            ConstantEvaluatorError::AutomaticConversionFloatToInt {
-                                to_type: "i64",
-                            },
-                        )?,
+                        Literal::F16(v) => f16::to_i64(&v).unwrap(), //Only None on NaN or Inf
                         Literal::AbstractInt(v) => i64::try_from_abstract(v)?,
                         Literal::AbstractFloat(v) => i64::try_from_abstract(v)?,
                     }),
@@ -1533,11 +1531,7 @@ impl<'a> ConstantEvaluator<'a> {
                         Literal::F64(v) => v as u64,
                         Literal::I64(v) => v as u64,
                         Literal::U64(v) => v,
-                        Literal::F16(v) => f16::to_u64(&v).ok_or(
-                            ConstantEvaluatorError::AutomaticConversionFloatToInt {
-                                to_type: "u64",
-                            },
-                        )?,
+                        Literal::F16(v) => f16::to_u64(&v).unwrap(), //Only None on NaN or Inf
                         Literal::AbstractInt(v) => u64::try_from_abstract(v)?,
                         Literal::AbstractFloat(v) => u64::try_from_abstract(v)?,
                     }),
@@ -1583,11 +1577,11 @@ impl<'a> ConstantEvaluator<'a> {
                         Literal::I32(v) => v != 0,
                         Literal::U32(v) => v != 0,
                         Literal::F32(v) => v != 0.0,
+                        Literal::F16(v) => v != f16::zero(),
                         Literal::Bool(v) => v,
                         Literal::F64(_)
                         | Literal::I64(_)
                         | Literal::U64(_)
-                        | Literal::F16(_)
                         | Literal::AbstractInt(_)
                         | Literal::AbstractFloat(_) => {
                             return make_error();

@@ -68,14 +68,9 @@ impl PartialEq for Dependency<'_> {
 
 impl Eq for Dependency<'_> {}
 
-/// A module-scope declaration.
+//A directive modifies how a WGSL program is processed by a WebGPU implementation.
 #[derive(Debug)]
-pub struct GlobalDirective {
-    pub kind: GlobalDirectiveKind,
-}
-
-#[derive(Debug)]
-pub enum GlobalDirectiveKind {
+pub enum GlobalDirective {
     Enable(EnableDirective),
 }
 
