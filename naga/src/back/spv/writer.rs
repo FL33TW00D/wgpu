@@ -823,6 +823,9 @@ impl Writer {
                 if bits == 64 {
                     self.capabilities_used.insert(spirv::Capability::Float64);
                 }
+                if bits == 16 {
+                    self.capabilities_used.insert(spirv::Capability::Float16);
+                }
                 Instruction::type_float(id, bits)
             }
             Sk::Bool => Instruction::type_bool(id),
