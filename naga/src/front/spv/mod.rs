@@ -5690,6 +5690,7 @@ mod test {
         let _ = super::parse_u8_slice(&bin, &Default::default()).unwrap();
     }
 
+    #[cfg(all(feature = "wgsl-in", feature = "wgsl-out"))]
     #[test]
     fn atomic_i_inc() {
         let _ = env_logger::builder()
