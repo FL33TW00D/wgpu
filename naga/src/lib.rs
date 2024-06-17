@@ -893,7 +893,7 @@ pub enum Literal {
 }
 
 /// Pipeline-overridable constant.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serialize", derive(Serialize))]
 #[cfg_attr(feature = "deserialize", derive(Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
@@ -911,7 +911,8 @@ pub struct Override {
 }
 
 /// Constant value.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 #[cfg_attr(feature = "serialize", derive(Serialize))]
 #[cfg_attr(feature = "deserialize", derive(Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
@@ -982,7 +983,7 @@ pub enum Extension {
 }
 
 /// Variable defined at module level.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "serialize", derive(Serialize))]
 #[cfg_attr(feature = "deserialize", derive(Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
@@ -1382,7 +1383,8 @@ bitflags::bitflags! {
 ///
 /// [`Constant`]: Expression::Constant
 /// [`Override`]: Expression::Override
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 #[cfg_attr(feature = "serialize", derive(Serialize))]
 #[cfg_attr(feature = "deserialize", derive(Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
