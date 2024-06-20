@@ -347,6 +347,24 @@ impl super::Adapter {
                 && features1.Int64ShaderOps != 0,
         );
 
+        let float16_supported = {
+            let mut features4: crate::dx12::types::D3D12_FEATURE_DATA_D3D12_OPTIONS4 =
+                unsafe { mem::zeroed() };
+            let hr = unsafe {
+                device.CheckFeatureSupport(
+                    23, // D3D12_FEATURE_D3D12_OPTIONS4: https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_feature#syntax
+                    &mut features4 as *mut _ as *mut _,
+                    mem::size_of::<crate::dx12::types::D3D12_FEATURE_DATA_D3D12_OPTIONS4>() as _,
+                )
+            };
+            hr == 0 && features4.Native16BitShaderOpsSupported != 0
+        };
+
+        features.set(
+            wgt::Features::SHADER_F16,
+            shader_model >= naga::back::hlsl::ShaderModel::V6_2 && float16_supported,
+        );
+
         features.set(
             wgt::Features::SUBGROUP,
             shader_model >= naga::back::hlsl::ShaderModel::V6_0
