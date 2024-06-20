@@ -9,7 +9,7 @@ use crate::{
     hal_api::HalApi,
     id::{self, Id},
     init_tracker::MemoryInitKind,
-    resource::{QuerySet, Resource},
+    resource::{ParentDevice, QuerySet},
     storage::Storage,
     Epoch, FastHashMap, Index,
 };
@@ -405,9 +405,7 @@ impl Global {
             .add_single(&*query_set_guard, query_set_id)
             .ok_or(QueryError::InvalidQuerySet(query_set_id))?;
 
-        if query_set.device.as_info().id() != cmd_buf.device.as_info().id() {
-            return Err(DeviceError::WrongDevice.into());
-        }
+        query_set.same_device_as(cmd_buf.as_ref())?;
 
         let (dst_buffer, dst_pending) = {
             let buffer_guard = hub.buffers.read();
@@ -415,9 +413,7 @@ impl Global {
                 .get(destination)
                 .map_err(|_| QueryError::InvalidBuffer(destination))?;
 
-            if dst_buffer.device.as_info().id() != cmd_buf.device.as_info().id() {
-                return Err(DeviceError::WrongDevice.into());
-            }
+            dst_buffer.same_device_as(cmd_buf.as_ref())?;
 
             tracker
                 .buffers

@@ -97,7 +97,7 @@ use crate::{
     id,
     init_tracker::{BufferInitTrackerAction, MemoryInitKind, TextureInitTrackerAction},
     pipeline::{PipelineFlags, RenderPipeline, VertexStep},
-    resource::{Buffer, Resource, ResourceInfo, ResourceType},
+    resource::{Buffer, ParentDevice, Resource, ResourceInfo, ResourceType},
     resource_log,
     snatch::SnatchGuard,
     track::RenderBundleScope,
@@ -349,6 +349,10 @@ impl RenderBundleEncoder {
         device: &Arc<Device<A>>,
         hub: &Hub<A>,
     ) -> Result<RenderBundle<A>, RenderBundleError> {
+        let scope = PassErrorScope::Bundle;
+
+        device.check_is_valid().map_pass_err(scope)?;
+
         let bind_group_guard = hub.bind_groups.read();
         let pipeline_guard = hub.render_pipelines.read();
         let buffer_guard = hub.buffers.read();
@@ -1104,6 +1108,12 @@ impl<A: HalApi> Resource for RenderBundle<A> {
     }
 }
 
+impl<A: HalApi> ParentDevice<A> for RenderBundle<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        &self.device
+    }
+}
+
 /// A render bundle's current index buffer state.
 ///
 /// [`RenderBundleEncoder::finish`] records the currently set index buffer here,
@@ -1504,10 +1514,12 @@ pub struct RenderBundleError {
 }
 
 impl RenderBundleError {
-    pub(crate) const INVALID_DEVICE: Self = RenderBundleError {
-        scope: PassErrorScope::Bundle,
-        inner: RenderBundleErrorInner::Device(DeviceError::Invalid),
-    };
+    pub fn from_device_error(e: DeviceError) -> Self {
+        Self {
+            scope: PassErrorScope::Bundle,
+            inner: e.into(),
+        }
+    }
 }
 impl PrettyError for RenderBundleError {
     fn fmt_pretty(&self, fmt: &mut ErrorFormatter) {

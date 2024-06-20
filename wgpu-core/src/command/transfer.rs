@@ -8,12 +8,12 @@ use crate::{
     error::{ErrorFormatter, PrettyError},
     global::Global,
     hal_api::HalApi,
-    id::{BufferId, CommandEncoderId, DeviceId, TextureId},
+    id::{BufferId, CommandEncoderId, TextureId},
     init_tracker::{
         has_copy_partial_init_tracker_coverage, MemoryInitKind, TextureInitRange,
         TextureInitTrackerAction,
     },
-    resource::{Resource, Texture, TextureErrorDimension},
+    resource::{ParentDevice, Texture, TextureErrorDimension},
     snatch::SnatchGuard,
     track::{TextureSelector, Tracker},
 };
@@ -41,8 +41,6 @@ pub enum CopySide {
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum TransferError {
-    #[error("Device {0:?} is invalid")]
-    InvalidDevice(DeviceId),
     #[error("Buffer {0:?} is invalid or destroyed")]
     InvalidBuffer(BufferId),
     #[error("Texture {0:?} is invalid or destroyed")]
@@ -579,9 +577,7 @@ impl Global {
         let cmd_buf_data = cmd_buf_data.as_mut().unwrap();
 
         let device = &cmd_buf.device;
-        if !device.is_valid() {
-            return Err(TransferError::InvalidDevice(cmd_buf.device.as_info().id()).into());
-        }
+        device.check_is_valid()?;
 
         #[cfg(feature = "trace")]
         if let Some(ref mut list) = cmd_buf_data.commands {
@@ -602,9 +598,7 @@ impl Global {
                 .get(source)
                 .map_err(|_| TransferError::InvalidBuffer(source))?;
 
-            if src_buffer.device.as_info().id() != device.as_info().id() {
-                return Err(DeviceError::WrongDevice.into());
-            }
+            src_buffer.same_device_as(cmd_buf.as_ref())?;
 
             cmd_buf_data
                 .trackers
@@ -628,9 +622,7 @@ impl Global {
                 .get(destination)
                 .map_err(|_| TransferError::InvalidBuffer(destination))?;
 
-            if dst_buffer.device.as_info().id() != device.as_info().id() {
-                return Err(DeviceError::WrongDevice.into());
-            }
+            dst_buffer.same_device_as(cmd_buf.as_ref())?;
 
             cmd_buf_data
                 .trackers
@@ -750,9 +742,7 @@ impl Global {
 
         let cmd_buf = CommandBuffer::get_encoder(hub, command_encoder_id)?;
         let device = &cmd_buf.device;
-        if !device.is_valid() {
-            return Err(TransferError::InvalidDevice(cmd_buf.device.as_info().id()).into());
-        }
+        device.check_is_valid()?;
 
         let mut cmd_buf_data = cmd_buf.data.lock();
         let cmd_buf_data = cmd_buf_data.as_mut().unwrap();
@@ -781,9 +771,7 @@ impl Global {
             .get(destination.texture)
             .map_err(|_| TransferError::InvalidTexture(destination.texture))?;
 
-        if dst_texture.device.as_info().id() != device.as_info().id() {
-            return Err(DeviceError::WrongDevice.into());
-        }
+        dst_texture.same_device_as(cmd_buf.as_ref())?;
 
         let (hal_copy_size, array_layer_count) = validate_texture_copy_range(
             destination,
@@ -816,9 +804,7 @@ impl Global {
                 .get(source.buffer)
                 .map_err(|_| TransferError::InvalidBuffer(source.buffer))?;
 
-            if src_buffer.device.as_info().id() != device.as_info().id() {
-                return Err(DeviceError::WrongDevice.into());
-            }
+            src_buffer.same_device_as(cmd_buf.as_ref())?;
 
             tracker
                 .buffers
@@ -921,9 +907,7 @@ impl Global {
 
         let cmd_buf = CommandBuffer::get_encoder(hub, command_encoder_id)?;
         let device = &cmd_buf.device;
-        if !device.is_valid() {
-            return Err(TransferError::InvalidDevice(cmd_buf.device.as_info().id()).into());
-        }
+        device.check_is_valid()?;
 
         let mut cmd_buf_data = cmd_buf.data.lock();
         let cmd_buf_data = cmd_buf_data.as_mut().unwrap();
@@ -951,9 +935,7 @@ impl Global {
             .get(source.texture)
             .map_err(|_| TransferError::InvalidTexture(source.texture))?;
 
-        if src_texture.device.as_info().id() != device.as_info().id() {
-            return Err(DeviceError::WrongDevice.into());
-        }
+        src_texture.same_device_as(cmd_buf.as_ref())?;
 
         let (hal_copy_size, array_layer_count) =
             validate_texture_copy_range(source, &src_texture.desc, CopySide::Source, copy_size)?;
@@ -1007,9 +989,7 @@ impl Global {
                 .get(destination.buffer)
                 .map_err(|_| TransferError::InvalidBuffer(destination.buffer))?;
 
-            if dst_buffer.device.as_info().id() != device.as_info().id() {
-                return Err(DeviceError::WrongDevice.into());
-            }
+            dst_buffer.same_device_as(cmd_buf.as_ref())?;
 
             tracker
                 .buffers
@@ -1104,9 +1084,7 @@ impl Global {
 
         let cmd_buf = CommandBuffer::get_encoder(hub, command_encoder_id)?;
         let device = &cmd_buf.device;
-        if !device.is_valid() {
-            return Err(TransferError::InvalidDevice(cmd_buf.device.as_info().id()).into());
-        }
+        device.check_is_valid()?;
 
         let snatch_guard = device.snatchable_lock.read();
 
@@ -1139,12 +1117,8 @@ impl Global {
             .get(destination.texture)
             .map_err(|_| TransferError::InvalidTexture(source.texture))?;
 
-        if src_texture.device.as_info().id() != device.as_info().id() {
-            return Err(DeviceError::WrongDevice.into());
-        }
-        if dst_texture.device.as_info().id() != device.as_info().id() {
-            return Err(DeviceError::WrongDevice.into());
-        }
+        src_texture.same_device_as(cmd_buf.as_ref())?;
+        dst_texture.same_device_as(cmd_buf.as_ref())?;
 
         // src and dst texture format must be copy-compatible
         // https://gpuweb.github.io/gpuweb/#copy-compatible

@@ -3,8 +3,8 @@ use crate::device::trace;
 use crate::{
     binding_model::BindGroup,
     device::{
-        queue, resource::DeferredDestroy, BufferMapPendingClosure, Device, DeviceError, HostMap,
-        MissingDownlevelFlags, MissingFeatures,
+        queue, resource::DeferredDestroy, BufferMapPendingClosure, Device, DeviceError,
+        DeviceMismatch, HostMap, MissingDownlevelFlags, MissingFeatures,
     },
     global::Global,
     hal_api::HalApi,
@@ -143,6 +143,48 @@ impl<T: Resource> ResourceInfo<T> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ResourceErrorIdent {
+    r#type: ResourceType,
+    label: String,
+}
+
+impl std::fmt::Display for ResourceErrorIdent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{} with '{}' label", self.r#type, self.label)
+    }
+}
+
+pub(crate) trait ParentDevice<A: HalApi>: Resource {
+    fn device(&self) -> &Arc<Device<A>>;
+
+    fn same_device_as<O: ParentDevice<A>>(&self, other: &O) -> Result<(), DeviceError> {
+        Arc::ptr_eq(self.device(), other.device())
+            .then_some(())
+            .ok_or_else(|| {
+                DeviceError::DeviceMismatch(Box::new(DeviceMismatch {
+                    res: self.error_ident(),
+                    res_device: self.device().error_ident(),
+                    target: Some(other.error_ident()),
+                    target_device: other.device().error_ident(),
+                }))
+            })
+    }
+
+    fn same_device(&self, device: &Arc<Device<A>>) -> Result<(), DeviceError> {
+        Arc::ptr_eq(self.device(), device)
+            .then_some(())
+            .ok_or_else(|| {
+                DeviceError::DeviceMismatch(Box::new(DeviceMismatch {
+                    res: self.error_ident(),
+                    res_device: self.device().error_ident(),
+                    target: None,
+                    target_device: device.error_ident(),
+                }))
+            })
+    }
+}
+
 pub(crate) type ResourceType = &'static str;
 
 pub(crate) trait Resource: 'static + Sized + WasmNotSendSync {
@@ -168,6 +210,12 @@ pub(crate) trait Resource: 'static + Sized + WasmNotSendSync {
     }
     fn is_equal(&self, other: &Self) -> bool {
         self.as_info().id().unzip() == other.as_info().id().unzip()
+    }
+    fn error_ident(&self) -> ResourceErrorIdent {
+        ResourceErrorIdent {
+            r#type: Self::TYPE,
+            label: self.label().to_owned(),
+        }
     }
 }
 
@@ -429,6 +477,107 @@ impl<A: HalApi> Buffer<A> {
         self.raw.get(guard).is_none()
     }
 
+    /// Returns the mapping callback in case of error so that the callback can be fired outside
+    /// of the locks that are held in this function.
+    pub(crate) fn map_async(
+        self: &Arc<Self>,
+        offset: wgt::BufferAddress,
+        size: Option<wgt::BufferAddress>,
+        op: BufferMapOperation,
+    ) -> Result<(), (BufferMapOperation, BufferAccessError)> {
+        let range_size = if let Some(size) = size {
+            size
+        } else if offset > self.size {
+            0
+        } else {
+            self.size - offset
+        };
+
+        if offset % wgt::MAP_ALIGNMENT != 0 {
+            return Err((op, BufferAccessError::UnalignedOffset { offset }));
+        }
+        if range_size % wgt::COPY_BUFFER_ALIGNMENT != 0 {
+            return Err((op, BufferAccessError::UnalignedRangeSize { range_size }));
+        }
+
+        let range = offset..(offset + range_size);
+
+        if range.start % wgt::MAP_ALIGNMENT != 0 || range.end % wgt::COPY_BUFFER_ALIGNMENT != 0 {
+            return Err((op, BufferAccessError::UnalignedRange));
+        }
+
+        let (pub_usage, internal_use) = match op.host {
+            HostMap::Read => (wgt::BufferUsages::MAP_READ, hal::BufferUses::MAP_READ),
+            HostMap::Write => (wgt::BufferUsages::MAP_WRITE, hal::BufferUses::MAP_WRITE),
+        };
+
+        if let Err(e) = crate::validation::check_buffer_usage(self.info.id(), self.usage, pub_usage)
+        {
+            return Err((op, e.into()));
+        }
+
+        if range.start > range.end {
+            return Err((
+                op,
+                BufferAccessError::NegativeRange {
+                    start: range.start,
+                    end: range.end,
+                },
+            ));
+        }
+        if range.end > self.size {
+            return Err((
+                op,
+                BufferAccessError::OutOfBoundsOverrun {
+                    index: range.end,
+                    max: self.size,
+                },
+            ));
+        }
+
+        let device = &self.device;
+        if let Err(e) = device.check_is_valid() {
+            return Err((op, e.into()));
+        }
+
+        {
+            let snatch_guard = device.snatchable_lock.read();
+            if self.is_destroyed(&snatch_guard) {
+                return Err((op, BufferAccessError::Destroyed));
+            }
+        }
+
+        {
+            let map_state = &mut *self.map_state.lock();
+            *map_state = match *map_state {
+                BufferMapState::Init { .. } | BufferMapState::Active { .. } => {
+                    return Err((op, BufferAccessError::AlreadyMapped));
+                }
+                BufferMapState::Waiting(_) => {
+                    return Err((op, BufferAccessError::MapAlreadyPending));
+                }
+                BufferMapState::Idle => BufferMapState::Waiting(BufferPendingMapping {
+                    range,
+                    op,
+                    _parent_buffer: self.clone(),
+                }),
+            };
+        }
+
+        let snatch_guard = device.snatchable_lock.read();
+        {
+            let mut trackers = device.as_ref().trackers.lock();
+            trackers.buffers.set_single(self, internal_use);
+            //TODO: Check if draining ALL buffers is correct!
+            let _ = trackers.buffers.drain_transitions(&snatch_guard);
+        }
+        drop(snatch_guard);
+
+        device.lock_life().map(self);
+
+        Ok(())
+    }
+
     // Note: This must not be called while holding a lock.
     pub(crate) fn unmap(self: &Arc<Self>) -> Result<(), BufferAccessError> {
         if let Some((mut operation, status)) = self.unmap_inner()? {
@@ -627,6 +776,12 @@ impl<A: HalApi> Resource for Buffer<A> {
     }
 }
 
+impl<A: HalApi> ParentDevice<A> for Buffer<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        &self.device
+    }
+}
+
 /// A buffer that has been marked as destroyed and is staged for actual deletion soon.
 #[derive(Debug)]
 pub struct DestroyedBuffer<A: HalApi> {
@@ -728,6 +883,12 @@ impl<A: HalApi> Resource for StagingBuffer<A> {
 
     fn label(&self) -> &str {
         "<StagingBuffer>"
+    }
+}
+
+impl<A: HalApi> ParentDevice<A> for StagingBuffer<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        &self.device
     }
 }
 
@@ -1245,6 +1406,12 @@ impl<A: HalApi> Resource for Texture<A> {
     }
 }
 
+impl<A: HalApi> ParentDevice<A> for Texture<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        &self.device
+    }
+}
+
 impl<A: HalApi> Borrow<TextureSelector> for Texture<A> {
     fn borrow(&self) -> &TextureSelector {
         &self.full_range
@@ -1410,6 +1577,12 @@ impl<A: HalApi> Resource for TextureView<A> {
     }
 }
 
+impl<A: HalApi> ParentDevice<A> for TextureView<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        &self.device
+    }
+}
+
 /// Describes a [`Sampler`]
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1531,6 +1704,12 @@ impl<A: HalApi> Resource for Sampler<A> {
     }
 }
 
+impl<A: HalApi> ParentDevice<A> for Sampler<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        &self.device
+    }
+}
+
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum CreateQuerySetError {
@@ -1568,6 +1747,12 @@ impl<A: HalApi> Drop for QuerySet<A> {
                 self.device.raw().destroy_query_set(raw);
             }
         }
+    }
+}
+
+impl<A: HalApi> ParentDevice<A> for QuerySet<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        &self.device
     }
 }
 

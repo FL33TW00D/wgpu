@@ -12,12 +12,12 @@ use crate::{
     global::Global,
     hal_api::HalApi,
     hal_label,
-    id::{self, DeviceId, QueueId},
+    id::{self, QueueId},
     init_tracker::{has_copy_partial_init_tracker_coverage, TextureInitRange},
     lock::{rank, Mutex, RwLockWriteGuard},
     resource::{
-        Buffer, BufferAccessError, BufferMapState, DestroyedBuffer, DestroyedTexture, Resource,
-        ResourceInfo, ResourceType, StagingBuffer, Texture, TextureInner,
+        Buffer, BufferAccessError, BufferMapState, DestroyedBuffer, DestroyedTexture, ParentDevice,
+        Resource, ResourceInfo, ResourceType, StagingBuffer, Texture, TextureInner,
     },
     resource_log, track, FastHashMap, SubmissionIndex,
 };
@@ -50,6 +50,12 @@ impl<A: HalApi> Resource for Queue<A> {
 
     fn as_info_mut(&mut self) -> &mut ResourceInfo<Self> {
         &mut self.info
+    }
+}
+
+impl<A: HalApi> ParentDevice<A> for Queue<A> {
+    fn device(&self) -> &Arc<Device<A>> {
+        self.device.as_ref().unwrap()
     }
 }
 
@@ -352,15 +358,6 @@ pub struct InvalidQueue;
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum QueueWriteError {
-    #[error(
-        "Device of queue ({:?}) does not match device of write recipient ({:?})",
-        queue_device_id,
-        target_device_id
-    )]
-    DeviceMismatch {
-        queue_device_id: DeviceId,
-        target_device_id: DeviceId,
-    },
     #[error(transparent)]
     Queue(#[from] DeviceError),
     #[error(transparent)]
@@ -405,13 +402,10 @@ impl Global {
 
         let hub = A::hub(self);
 
-        let buffer_device_id = hub
+        let buffer = hub
             .buffers
             .get(buffer_id)
-            .map_err(|_| TransferError::InvalidBuffer(buffer_id))?
-            .device
-            .as_info()
-            .id();
+            .map_err(|_| TransferError::InvalidBuffer(buffer_id))?;
 
         let queue = hub
             .queues
@@ -420,15 +414,7 @@ impl Global {
 
         let device = queue.device.as_ref().unwrap();
 
-        {
-            let queue_device_id = device.as_info().id();
-            if buffer_device_id != queue_device_id {
-                return Err(QueueWriteError::DeviceMismatch {
-                    queue_device_id,
-                    target_device_id: buffer_device_id,
-                });
-            }
-        }
+        buffer.same_device_as(queue.as_ref())?;
 
         let data_size = data.len() as wgt::BufferAddress;
 
@@ -469,6 +455,7 @@ impl Global {
         }
 
         let result = self.queue_write_staging_buffer_impl(
+            &queue,
             device,
             pending_writes,
             &staging_buffer,
@@ -543,6 +530,7 @@ impl Global {
         }
 
         let result = self.queue_write_staging_buffer_impl(
+            &queue,
             device,
             pending_writes,
             &staging_buffer,
@@ -607,7 +595,8 @@ impl Global {
 
     fn queue_write_staging_buffer_impl<A: HalApi>(
         &self,
-        device: &Device<A>,
+        queue: &Arc<Queue<A>>,
+        device: &Arc<Device<A>>,
         pending_writes: &mut PendingWrites<A>,
         staging_buffer: &StagingBuffer<A>,
         buffer_id: id::BufferId,
@@ -632,9 +621,7 @@ impl Global {
             .get(&snatch_guard)
             .ok_or(TransferError::InvalidBuffer(buffer_id))?;
 
-        if dst.device.as_info().id() != device.as_info().id() {
-            return Err(DeviceError::WrongDevice.into());
-        }
+        dst.same_device_as(queue.as_ref())?;
 
         let src_buffer_size = staging_buffer.size;
         self.queue_validate_write_buffer_impl(&dst, buffer_id, buffer_offset, src_buffer_size)?;
@@ -717,9 +704,7 @@ impl Global {
             .get(destination.texture)
             .map_err(|_| TransferError::InvalidTexture(destination.texture))?;
 
-        if dst.device.as_info().id().into_queue_id() != queue_id {
-            return Err(DeviceError::WrongDevice.into());
-        }
+        dst.same_device_as(queue.as_ref())?;
 
         if !dst.desc.usage.contains(wgt::TextureUsages::COPY_DST) {
             return Err(
@@ -1200,9 +1185,7 @@ impl Global {
                             Err(_) => continue,
                         };
 
-                        if cmdbuf.device.as_info().id().into_queue_id() != queue_id {
-                            return Err(DeviceError::WrongDevice.into());
-                        }
+                        cmdbuf.same_device_as(queue.as_ref())?;
 
                         #[cfg(feature = "trace")]
                         if let Some(ref mut trace) = *device.trace.lock() {
@@ -1549,6 +1532,8 @@ impl Global {
 
         // the closures should execute with nothing locked!
         callbacks.fire();
+
+        api_log!("Queue::submit to {queue_id:?} returned submit index {submit_index}");
 
         Ok(WrappedSubmissionIndex {
             queue_id,
