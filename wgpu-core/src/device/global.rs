@@ -16,7 +16,6 @@ use crate::{
     resource::{
         self, BufferAccessError, BufferAccessResult, BufferMapOperation, CreateBufferError,
     },
-    validation::check_buffer_usage,
     Label, LabelHelpers as _,
 };
 
@@ -160,11 +159,6 @@ impl Global {
                 }
             };
 
-            if desc.usage.is_empty() {
-                // Per spec, `usage` must not be zero.
-                break 'error CreateBufferError::InvalidUsage(desc.usage);
-            }
-
             #[cfg(feature = "trace")]
             if let Some(ref mut trace) = *device.trace.lock() {
                 let mut desc = desc.clone();
@@ -173,6 +167,11 @@ impl Global {
                     desc.usage |= wgt::BufferUsages::COPY_DST;
                 }
                 trace.add(trace::Action::CreateBuffer(fid.id(), desc));
+            }
+
+            if desc.usage.is_empty() {
+                // Per spec, `usage` must not be zero.
+                break 'error CreateBufferError::InvalidUsage(desc.usage);
             }
 
             let buffer = match device.create_buffer(desc, false) {
@@ -382,15 +381,11 @@ impl Global {
             .devices
             .get(device_id)
             .map_err(|_| DeviceError::InvalidDeviceId)?;
-        let snatch_guard = device.snatchable_lock.read();
-        device.check_is_valid()?;
 
         let buffer = hub
             .buffers
             .get(buffer_id)
-            .map_err(|_| BufferAccessError::Invalid)?;
-        check_buffer_usage(buffer_id, buffer.usage, wgt::BufferUsages::MAP_WRITE)?;
-        //assert!(buffer isn't used by the GPU);
+            .map_err(|_| BufferAccessError::InvalidBufferId(buffer_id))?;
 
         #[cfg(feature = "trace")]
         if let Some(ref mut trace) = *device.trace.lock() {
@@ -403,9 +398,12 @@ impl Global {
             });
         }
 
-        let raw_buf = buffer
-            .raw(&snatch_guard)
-            .ok_or(BufferAccessError::Destroyed)?;
+        device.check_is_valid()?;
+        buffer.check_usage(wgt::BufferUsages::MAP_WRITE)?;
+        //assert!(buffer isn't used by the GPU);
+
+        let snatch_guard = device.snatchable_lock.read();
+        let raw_buf = buffer.try_raw(&snatch_guard)?;
         unsafe {
             let mapping = device
                 .raw()
@@ -449,13 +447,11 @@ impl Global {
         let buffer = hub
             .buffers
             .get(buffer_id)
-            .map_err(|_| BufferAccessError::Invalid)?;
-        check_buffer_usage(buffer_id, buffer.usage, wgt::BufferUsages::MAP_READ)?;
+            .map_err(|_| BufferAccessError::InvalidBufferId(buffer_id))?;
+        buffer.check_usage(wgt::BufferUsages::MAP_READ)?;
         //assert!(buffer isn't used by the GPU);
 
-        let raw_buf = buffer
-            .raw(&snatch_guard)
-            .ok_or(BufferAccessError::Destroyed)?;
+        let raw_buf = buffer.try_raw(&snatch_guard)?;
         unsafe {
             let mapping = device
                 .raw()
@@ -495,7 +491,15 @@ impl Global {
             .get(buffer_id)
             .map_err(|_| resource::DestroyError::Invalid)?;
 
-        let _ = buffer.unmap();
+        #[cfg(feature = "trace")]
+        if let Some(trace) = buffer.device.trace.lock().as_mut() {
+            trace.add(trace::Action::FreeBuffer(buffer_id));
+        }
+
+        let _ = buffer.unmap(
+            #[cfg(feature = "trace")]
+            buffer_id,
+        );
 
         buffer.destroy()
     }
@@ -513,7 +517,15 @@ impl Global {
             }
         };
 
-        let _ = buffer.unmap();
+        #[cfg(feature = "trace")]
+        if let Some(t) = buffer.device.trace.lock().as_mut() {
+            t.add(trace::Action::DestroyBuffer(buffer_id));
+        }
+
+        let _ = buffer.unmap(
+            #[cfg(feature = "trace")]
+            buffer_id,
+        );
 
         let last_submit_index = buffer.info.submission_index();
 
@@ -524,8 +536,7 @@ impl Global {
             .lock()
             .as_ref()
             .unwrap()
-            .dst_buffers
-            .contains_key(&buffer_id)
+            .contains_buffer(&buffer)
         {
             device.lock_life().future_suspected_buffers.push(buffer);
         } else {
@@ -561,6 +572,7 @@ impl Global {
                 Ok(device) => device,
                 Err(_) => break 'error DeviceError::InvalidDeviceId.into(),
             };
+
             #[cfg(feature = "trace")]
             if let Some(ref mut trace) = *device.trace.lock() {
                 trace.add(trace::Action::CreateTexture(fid.id(), desc.clone()));
@@ -730,6 +742,11 @@ impl Global {
             .get(texture_id)
             .map_err(|_| resource::DestroyError::Invalid)?;
 
+        #[cfg(feature = "trace")]
+        if let Some(trace) = texture.device.trace.lock().as_mut() {
+            trace.add(trace::Action::FreeTexture(texture_id));
+        }
+
         texture.destroy()
     }
 
@@ -740,6 +757,11 @@ impl Global {
         let hub = A::hub(self);
 
         if let Some(texture) = hub.textures.unregister(texture_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = texture.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyTexture(texture_id));
+            }
+
             let last_submit_index = texture.info.submission_index();
 
             let device = &texture.device;
@@ -749,8 +771,7 @@ impl Global {
                     .lock()
                     .as_ref()
                     .unwrap()
-                    .dst_textures
-                    .contains_key(&texture_id)
+                    .contains_texture(&texture)
                 {
                     device
                         .lock_life()
@@ -774,7 +795,6 @@ impl Global {
         }
     }
 
-    #[allow(unused_unsafe)]
     pub fn texture_create_view<A: HalApi>(
         &self,
         texture_id: id::TextureId,
@@ -790,15 +810,12 @@ impl Global {
         let error = 'error: {
             let texture = match hub.textures.get(texture_id) {
                 Ok(texture) => texture,
-                Err(_) => break 'error resource::CreateTextureViewError::InvalidTexture,
+                Err(_) => {
+                    break 'error resource::CreateTextureViewError::InvalidTextureId(texture_id)
+                }
             };
             let device = &texture.device;
-            {
-                let snatch_guard = device.snatchable_lock.read();
-                if texture.is_destroyed(&snatch_guard) {
-                    break 'error resource::CreateTextureViewError::InvalidTexture;
-                }
-            }
+
             #[cfg(feature = "trace")]
             if let Some(ref mut trace) = *device.trace.lock() {
                 trace.add(trace::Action::CreateTextureView {
@@ -808,7 +825,14 @@ impl Global {
                 });
             }
 
-            let view = match unsafe { device.create_texture_view(&texture, desc) } {
+            {
+                let snatch_guard = device.snatchable_lock.read();
+                if let Err(e) = texture.check_destroyed(&snatch_guard) {
+                    break 'error e.into();
+                }
+            }
+
+            let view = match device.create_texture_view(&texture, desc) {
                 Ok(view) => view,
                 Err(e) => break 'error e,
             };
@@ -817,6 +841,10 @@ impl Global {
 
             {
                 let mut views = texture.views.lock();
+
+                // Remove stale weak references
+                views.retain(|view| view.strong_count() > 0);
+
                 views.push(Arc::downgrade(&resource));
             }
 
@@ -845,6 +873,11 @@ impl Global {
         let hub = A::hub(self);
 
         if let Some(view) = hub.texture_views.unregister(texture_view_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = view.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyTextureView(texture_view_id));
+            }
+
             let last_submit_index = view.info.submission_index();
 
             view.device
@@ -914,6 +947,11 @@ impl Global {
         let hub = A::hub(self);
 
         if let Some(sampler) = hub.samplers.unregister(sampler_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = sampler.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroySampler(sampler_id));
+            }
+
             sampler
                 .device
                 .lock_life()
@@ -1015,6 +1053,11 @@ impl Global {
         let hub = A::hub(self);
 
         if let Some(layout) = hub.bind_group_layouts.unregister(bind_group_layout_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = layout.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyBindGroupLayout(bind_group_layout_id));
+            }
+
             layout
                 .device
                 .lock_life()
@@ -1073,6 +1116,11 @@ impl Global {
 
         let hub = A::hub(self);
         if let Some(layout) = hub.pipeline_layouts.unregister(pipeline_layout_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = layout.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyPipelineLayout(pipeline_layout_id));
+            }
+
             layout
                 .device
                 .lock_life()
@@ -1118,10 +1166,20 @@ impl Global {
 
             let weak_ref = Arc::downgrade(&resource);
             for range in &resource.used_texture_ranges {
-                range.texture.bind_groups.lock().push(weak_ref.clone());
+                let mut bind_groups = range.texture.bind_groups.lock();
+
+                // Remove stale weak references
+                bind_groups.retain(|bg| bg.strong_count() > 0);
+
+                bind_groups.push(weak_ref.clone());
             }
             for range in &resource.used_buffer_ranges {
-                range.buffer.bind_groups.lock().push(weak_ref.clone());
+                let mut bind_groups = range.buffer.bind_groups.lock();
+
+                // Remove stale weak references
+                bind_groups.retain(|bg| bg.strong_count() > 0);
+
+                bind_groups.push(weak_ref.clone());
             }
 
             api_log!("Device::create_bind_group -> {id:?}");
@@ -1145,6 +1203,11 @@ impl Global {
         let hub = A::hub(self);
 
         if let Some(bind_group) = hub.bind_groups.unregister(bind_group_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = bind_group.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyBindGroup(bind_group_id));
+            }
+
             bind_group
                 .device
                 .lock_life()
@@ -1300,7 +1363,14 @@ impl Global {
         api_log!("ShaderModule::drop {shader_module_id:?}");
 
         let hub = A::hub(self);
-        hub.shader_modules.unregister(shader_module_id);
+
+        if let Some(shader_module) = hub.shader_modules.unregister(shader_module_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = shader_module.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyShaderModule(shader_module_id));
+            }
+            drop(shader_module)
+        }
     }
 
     pub fn device_create_command_encoder<A: HalApi>(
@@ -1442,6 +1512,11 @@ impl Global {
         let hub = A::hub(self);
 
         if let Some(bundle) = hub.render_bundles.unregister(render_bundle_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = bundle.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyRenderBundle(render_bundle_id));
+            }
+
             bundle
                 .device
                 .lock_life()
@@ -1467,6 +1542,7 @@ impl Global {
                 Ok(device) => device,
                 Err(_) => break 'error DeviceError::InvalidDeviceId.into(),
             };
+
             #[cfg(feature = "trace")]
             if let Some(ref mut trace) = *device.trace.lock() {
                 trace.add(trace::Action::CreateQuerySet {
@@ -1501,7 +1577,7 @@ impl Global {
             let device = &query_set.device;
 
             #[cfg(feature = "trace")]
-            if let Some(ref mut trace) = *device.trace.lock() {
+            if let Some(trace) = device.trace.lock().as_mut() {
                 trace.add(trace::Action::DestroyQuerySet(query_set_id));
             }
 
@@ -1540,6 +1616,7 @@ impl Global {
                 Ok(device) => device,
                 Err(_) => break 'error DeviceError::InvalidDeviceId.into(),
             };
+
             #[cfg(feature = "trace")]
             if let Some(ref mut trace) = *device.trace.lock() {
                 trace.add(trace::Action::CreateRenderPipeline {
@@ -1637,6 +1714,12 @@ impl Global {
 
         if let Some(pipeline) = hub.render_pipelines.unregister(render_pipeline_id) {
             let device = &pipeline.device;
+
+            #[cfg(feature = "trace")]
+            if let Some(t) = pipeline.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyRenderPipeline(render_pipeline_id));
+            }
+
             let mut life_lock = device.lock_life();
             life_lock
                 .suspected_resources
@@ -1682,6 +1765,7 @@ impl Global {
                     implicit_context: implicit_context.clone(),
                 });
             }
+
             let pipeline = match device.create_compute_pipeline(desc, implicit_context, hub) {
                 Ok(pair) => pair,
                 Err(e) => break 'error e,
@@ -1767,6 +1851,12 @@ impl Global {
 
         if let Some(pipeline) = hub.compute_pipelines.unregister(compute_pipeline_id) {
             let device = &pipeline.device;
+
+            #[cfg(feature = "trace")]
+            if let Some(t) = device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyComputePipeline(compute_pipeline_id));
+            }
+
             let mut life_lock = device.lock_life();
             life_lock
                 .suspected_resources
@@ -1802,6 +1892,7 @@ impl Global {
                 // TODO: Handle error properly
                 Err(crate::storage::InvalidId) => break 'error DeviceError::InvalidDeviceId.into(),
             };
+
             #[cfg(feature = "trace")]
             if let Some(ref mut trace) = *device.trace.lock() {
                 trace.add(trace::Action::CreatePipelineCache {
@@ -1809,6 +1900,7 @@ impl Global {
                     desc: desc.clone(),
                 });
             }
+
             let cache = unsafe { device.create_pipeline_cache(desc) };
             match cache {
                 Ok(cache) => {
@@ -1832,6 +1924,10 @@ impl Global {
         let hub = A::hub(self);
 
         if let Some(cache) = hub.pipeline_caches.unregister(pipeline_cache_id) {
+            #[cfg(feature = "trace")]
+            if let Some(t) = cache.device.trace.lock().as_mut() {
+                t.add(trace::Action::DestroyPipelineCache(pipeline_cache_id));
+            }
             drop(cache)
         }
     }
@@ -1969,13 +2065,14 @@ impl Global {
                     Ok(device) => device,
                     Err(_) => break 'error DeviceError::InvalidDeviceId.into(),
                 };
-                if let Err(e) = device.check_is_valid() {
-                    break 'error e.into();
-                }
 
                 #[cfg(feature = "trace")]
                 if let Some(ref mut trace) = *device.trace.lock() {
                     trace.add(trace::Action::ConfigureSurface(surface_id, config.clone()));
+                }
+
+                if let Err(e) = device.check_is_valid() {
+                    break 'error e.into();
                 }
 
                 let surface = match surface_guard.get(surface_id) {
@@ -2408,6 +2505,21 @@ impl Global {
         }
     }
 
+    pub fn device_get_internal_counters<A: HalApi>(
+        &self,
+        device_id: DeviceId,
+    ) -> wgt::InternalCounters {
+        let hub = A::hub(self);
+        if let Ok(device) = hub.devices.get(device_id) {
+            wgt::InternalCounters {
+                hal: device.get_hal_counters(),
+                core: wgt::CoreCounters {},
+            }
+        } else {
+            Default::default()
+        }
+    }
+
     pub fn queue_drop<A: HalApi>(&self, queue_id: QueueId) {
         profiling::scope!("Queue::drop");
         api_log!("Queue::drop {queue_id:?}");
@@ -2433,7 +2545,7 @@ impl Global {
         let op_and_err = 'error: {
             let buffer = match hub.buffers.get(buffer_id) {
                 Ok(buffer) => buffer,
-                Err(_) => break 'error Some((op, BufferAccessError::Invalid)),
+                Err(_) => break 'error Some((op, BufferAccessError::InvalidBufferId(buffer_id))),
             };
 
             buffer.map_async(offset, size, op).err()
@@ -2467,13 +2579,11 @@ impl Global {
         let buffer = hub
             .buffers
             .get(buffer_id)
-            .map_err(|_| BufferAccessError::Invalid)?;
+            .map_err(|_| BufferAccessError::InvalidBufferId(buffer_id))?;
 
         {
             let snatch_guard = buffer.device.snatchable_lock.read();
-            if buffer.is_destroyed(&snatch_guard) {
-                return Err(BufferAccessError::Destroyed);
-            }
+            buffer.check_destroyed(&snatch_guard)?;
         }
 
         let range_size = if let Some(size) = size {
@@ -2536,16 +2646,17 @@ impl Global {
         let buffer = hub
             .buffers
             .get(buffer_id)
-            .map_err(|_| BufferAccessError::Invalid)?;
+            .map_err(|_| BufferAccessError::InvalidBufferId(buffer_id))?;
 
         let snatch_guard = buffer.device.snatchable_lock.read();
-        if buffer.is_destroyed(&snatch_guard) {
-            return Err(BufferAccessError::Destroyed);
-        }
+        buffer.check_destroyed(&snatch_guard)?;
         drop(snatch_guard);
 
         buffer.device.check_is_valid()?;
-        buffer.unmap()
+        buffer.unmap(
+            #[cfg(feature = "trace")]
+            buffer_id,
+        )
     }
 }
 

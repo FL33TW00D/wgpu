@@ -9,7 +9,10 @@ When this texture is presented, we remove it from the device tracker as well as
 extract it from the hub.
 !*/
 
-use std::{borrow::Borrow, sync::Arc};
+use std::{
+    borrow::{Borrow, Cow},
+    sync::Arc,
+};
 
 #[cfg(feature = "trace")]
 use crate::device::trace::Action;
@@ -225,7 +228,7 @@ impl Global {
                         mips: 0..1,
                     },
                     info: ResourceInfo::new(
-                        "<Surface Texture>",
+                        &Some(Cow::Borrowed("<Surface Texture>")),
                         Some(device.tracker_indices.textures.clone()),
                     ),
                     clear_mode: RwLock::new(
@@ -301,13 +304,14 @@ impl Global {
         };
 
         let device = present.device.downcast_ref::<A>().unwrap();
-        device.check_is_valid()?;
-        let queue = device.get_queue().unwrap();
 
         #[cfg(feature = "trace")]
         if let Some(ref mut trace) = *device.trace.lock() {
             trace.add(Action::Present(surface_id));
         }
+
+        device.check_is_valid()?;
+        let queue = device.get_queue().unwrap();
 
         let result = {
             let texture_id = present
@@ -393,12 +397,13 @@ impl Global {
         };
 
         let device = present.device.downcast_ref::<A>().unwrap();
-        device.check_is_valid()?;
 
         #[cfg(feature = "trace")]
         if let Some(ref mut trace) = *device.trace.lock() {
             trace.add(Action::DiscardSurfaceTexture(surface_id));
         }
+
+        device.check_is_valid()?;
 
         {
             let texture_id = present

@@ -1,7 +1,7 @@
 use super::{sampler as sm, Error, LocationMode, Options, PipelineOptions, TranslationInfo};
 use crate::{
-    arena::Handle,
-    back,
+    arena::{Handle, HandleSet},
+    back::{self, Baked},
     proc::index,
     proc::{self, NameKey, TypeResolution},
     valid, FastHashMap, FastHashSet,
@@ -87,6 +87,41 @@ const fn scalar_is_int(scalar: crate::Scalar) -> bool {
 
 /// Prefix for cached clamped level-of-detail values for `ImageLoad` expressions.
 const CLAMPED_LOD_LOAD_PREFIX: &str = "clamped_lod_e";
+
+/// Wrapper for identifier names for clamped level-of-detail values
+///
+/// Values of this type implement [`std::fmt::Display`], formatting as
+/// the name of the variable used to hold the cached clamped
+/// level-of-detail value for an `ImageLoad` expression.
+struct ClampedLod(Handle<crate::Expression>);
+
+impl Display for ClampedLod {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.write_prefixed(f, CLAMPED_LOD_LOAD_PREFIX)
+    }
+}
+
+/// Wrapper for generating `struct _mslBufferSizes` member names for
+/// runtime-sized array lengths.
+///
+/// On Metal, `wgpu_hal` passes the element counts for all runtime-sized arrays
+/// as an argument to the entry point. This argument's type in the MSL is
+/// `struct _mslBufferSizes`, a Naga-synthesized struct with a `uint` member for
+/// each global variable containing a runtime-sized array.
+///
+/// If `global` is a [`Handle`] for a [`GlobalVariable`] that contains a
+/// runtime-sized array, then the value `ArraySize(global)` implements
+/// [`std::fmt::Display`], formatting as the name of the struct member carrying
+/// the number of elements in that runtime-sized array.
+///
+/// [`GlobalVariable`]: crate::GlobalVariable
+struct ArraySizeMember(Handle<crate::GlobalVariable>);
+
+impl Display for ArraySizeMember {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.0.write_prefixed(f, "size")
+    }
+}
 
 struct TypeContext<'a> {
     handle: Handle<crate::Type>,
@@ -555,11 +590,10 @@ struct ExpressionContext<'a> {
     lang_version: (u8, u8),
     policies: index::BoundsCheckPolicies,
 
-    /// A bitset containing the `Expression` handle indexes of expressions used
-    /// as indices in `ReadZeroSkipWrite`-policy accesses. These may need to be
-    /// cached in temporary variables. See `index::find_checked_indexes` for
-    /// details.
-    guarded_indices: BitSet,
+    /// The set of expressions used as indices in `ReadZeroSkipWrite`-policy
+    /// accesses. These may need to be cached in temporary variables. See
+    /// `index::find_checked_indexes` for details.
+    guarded_indices: HandleSet<crate::Expression>,
 }
 
 impl<'a> ExpressionContext<'a> {
@@ -683,9 +717,7 @@ impl<W: Write> Writer<W> {
     ) -> BackendResult {
         match level {
             LevelOfDetail::Direct(expr) => self.put_expression(expr, context, true)?,
-            LevelOfDetail::Restricted(load) => {
-                write!(self.out, "{}{}", CLAMPED_LOD_LOAD_PREFIX, load.index())?
-            }
+            LevelOfDetail::Restricted(load) => write!(self.out, "{}", ClampedLod(load))?,
         }
         Ok(())
     }
@@ -1152,8 +1184,8 @@ impl<W: Write> Writer<W> {
         // prevent that.
         write!(
             self.out,
-            "(_buffer_sizes.size{idx} - {offset} - {size}) / {stride}",
-            idx = handle.index(),
+            "(_buffer_sizes.{member} - {offset} - {size}) / {stride}",
+            member = ArraySizeMember(handle),
             offset = offset,
             size = size,
             stride = stride,
@@ -2799,13 +2831,7 @@ impl<W: Write> Writer<W> {
             return Ok(());
         }
 
-        write!(
-            self.out,
-            "{}uint {}{} = ",
-            indent,
-            CLAMPED_LOD_LOAD_PREFIX,
-            load.index(),
-        )?;
+        write!(self.out, "{}uint {} = ", indent, ClampedLod(load),)?;
         self.put_restricted_scalar_image_index(
             image,
             level_of_detail,
@@ -2867,15 +2893,14 @@ impl<W: Write> Writer<W> {
                             // If this expression is an index that we're going to first compare
                             // against a limit, and then actually use as an index, then we may
                             // want to cache it in a temporary, to avoid evaluating it twice.
-                            let bake =
-                                if context.expression.guarded_indices.contains(handle.index()) {
-                                    true
-                                } else {
-                                    self.need_bake_expressions.contains(&handle)
-                                };
+                            let bake = if context.expression.guarded_indices.contains(handle) {
+                                true
+                            } else {
+                                self.need_bake_expressions.contains(&handle)
+                            };
 
                             if bake {
-                                Some(format!("{}{}", back::BAKE_PREFIX, handle.index()))
+                                Some(Baked(handle).to_string())
                             } else {
                                 None
                             }
@@ -3030,7 +3055,7 @@ impl<W: Write> Writer<W> {
                 } => {
                     write!(self.out, "{level}")?;
                     if let Some(expr) = result {
-                        let name = format!("{}{}", back::BAKE_PREFIX, expr.index());
+                        let name = Baked(expr).to_string();
                         self.start_baking_expression(expr, &context.expression, &name)?;
                         self.named_expressions.insert(expr, name);
                     }
@@ -3085,7 +3110,7 @@ impl<W: Write> Writer<W> {
                     // operating on a 64-bit value, `result` is `None`.
                     write!(self.out, "{level}")?;
                     let fun_str = if let Some(result) = result {
-                        let res_name = format!("{}{}", back::BAKE_PREFIX, result.index());
+                        let res_name = Baked(result).to_string();
                         self.start_baking_expression(result, &context.expression, &res_name)?;
                         self.named_expressions.insert(result, res_name);
                         fun.to_msl()?
@@ -3191,7 +3216,7 @@ impl<W: Write> Writer<W> {
                         }
                         crate::RayQueryFunction::Proceed { result } => {
                             write!(self.out, "{level}")?;
-                            let name = format!("{}{}", back::BAKE_PREFIX, result.index());
+                            let name = Baked(result).to_string();
                             self.start_baking_expression(result, &context.expression, &name)?;
                             self.named_expressions.insert(result, name);
                             self.put_expression(query, &context.expression, true)?;
@@ -3465,24 +3490,30 @@ impl<W: Write> Writer<W> {
         writeln!(self.out)?;
 
         {
-            let mut indices = vec![];
-            for (handle, var) in module.global_variables.iter() {
-                if needs_array_length(var.ty, &module.types) {
-                    let idx = handle.index();
-                    indices.push(idx);
-                }
-            }
+            // Make a `Vec` of all the `GlobalVariable`s that contain
+            // runtime-sized arrays.
+            let globals: Vec<Handle<crate::GlobalVariable>> = module
+                .global_variables
+                .iter()
+                .filter(|&(_, var)| needs_array_length(var.ty, &module.types))
+                .map(|(handle, _)| handle)
+                .collect();
 
             let mut buffer_indices = vec![];
             for vbm in &pipeline_options.vertex_buffer_mappings {
                 buffer_indices.push(vbm.id);
             }
 
-            if !indices.is_empty() || !buffer_indices.is_empty() {
+            if !globals.is_empty() || !buffer_indices.is_empty() {
                 writeln!(self.out, "struct _mslBufferSizes {{")?;
 
-                for idx in indices {
-                    writeln!(self.out, "{}uint size{};", back::INDENT, idx)?;
+                for global in globals {
+                    writeln!(
+                        self.out,
+                        "{}uint {};",
+                        back::INDENT,
+                        ArraySizeMember(global)
+                    )?;
                 }
 
                 for idx in buffer_indices {

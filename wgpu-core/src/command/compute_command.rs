@@ -72,7 +72,7 @@ pub enum ComputeCommand {
 
 impl ComputeCommand {
     /// Resolves all ids in a list of commands into the corresponding resource Arc.
-    ///
+    //
     // TODO: Once resolving is done on-the-fly during recording, this function should be only needed with the replay feature:
     // #[cfg(feature = "replay")]
     pub fn resolve_compute_command_ids<A: HalApi>(
@@ -97,8 +97,8 @@ impl ComputeCommand {
                         num_dynamic_offsets,
                         bind_group: bind_group_guard.get_owned(bind_group_id).map_err(|_| {
                             ComputePassError {
-                                scope: PassErrorScope::SetBindGroup(bind_group_id),
-                                inner: ComputePassErrorInner::InvalidBindGroup(index),
+                                scope: PassErrorScope::SetBindGroup,
+                                inner: ComputePassErrorInner::InvalidBindGroupId(bind_group_id),
                             }
                         })?,
                     },
@@ -107,7 +107,7 @@ impl ComputeCommand {
                         pipelines_guard
                             .get_owned(pipeline_id)
                             .map_err(|_| ComputePassError {
-                                scope: PassErrorScope::SetPipelineCompute(pipeline_id),
+                                scope: PassErrorScope::SetPipelineCompute,
                                 inner: ComputePassErrorInner::InvalidPipeline(pipeline_id),
                             })?,
                     ),
@@ -128,11 +128,8 @@ impl ComputeCommand {
                         ArcComputeCommand::DispatchIndirect {
                             buffer: buffers_guard.get_owned(buffer_id).map_err(|_| {
                                 ComputePassError {
-                                    scope: PassErrorScope::Dispatch {
-                                        indirect: true,
-                                        pipeline: None, // TODO: not used right now, but once we do the resolve during recording we can use this again.
-                                    },
-                                    inner: ComputePassErrorInner::InvalidBuffer(buffer_id),
+                                    scope: PassErrorScope::Dispatch { indirect: true },
+                                    inner: ComputePassErrorInner::InvalidBufferId(buffer_id),
                                 }
                             })?,
                             offset,
