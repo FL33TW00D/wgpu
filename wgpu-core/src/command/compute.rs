@@ -1,5 +1,7 @@
 use crate::{
-    binding_model::{BindError, LateMinBufferBindingSizeMismatch, PushConstantUploadError},
+    binding_model::{
+        BindError, BindGroup, LateMinBufferBindingSizeMismatch, PushConstantUploadError,
+    },
     command::{
         bind::Binder,
         compute_command::{ArcComputeCommand, ComputeCommand},
@@ -9,16 +11,19 @@ use crate::{
         CommandBuffer, CommandEncoderError, CommandEncoderStatus, MapPassErr, PassErrorScope,
         QueryUseError, StateChange,
     },
-    device::{DeviceError, MissingDownlevelFlags, MissingFeatures},
+    device::{Device, DeviceError, MissingDownlevelFlags, MissingFeatures},
     error::{ErrorFormatter, PrettyError},
     global::Global,
     hal_api::HalApi,
     hal_label, id,
-    init_tracker::MemoryInitKind,
-    resource::{self, ParentDevice, Resource},
+    init_tracker::{BufferInitTrackerAction, MemoryInitKind},
+    pipeline::ComputePipeline,
+    resource::{
+        self, Buffer, DestroyedResourceError, MissingBufferUsageError, ParentDevice, Resource,
+        ResourceErrorIdent,
+    },
     snatch::SnatchGuard,
-    track::{Tracker, TrackerIndex, UsageConflict, UsageScope},
-    validation::{check_buffer_usage, MissingBufferUsageError},
+    track::{ResourceUsageCompatibilityError, Tracker, TrackerIndex, UsageScope},
     Label,
 };
 
@@ -34,7 +39,7 @@ use wgt::{BufferAddress, DynamicOffset};
 use std::sync::Arc;
 use std::{fmt, mem, str};
 
-use super::DynComputePass;
+use super::{memory_init::CommandBufferTextureMemoryActions, DynComputePass};
 
 pub struct ComputePass<A: HalApi> {
     /// All pass data & records is stored here.
@@ -74,11 +79,6 @@ impl<A: HalApi> ComputePass<A> {
     }
 
     #[inline]
-    pub fn parent_id(&self) -> Option<id::CommandBufferId> {
-        self.parent.as_ref().map(|cmd_buf| cmd_buf.as_info().id())
-    }
-
-    #[inline]
     pub fn label(&self) -> Option<&str> {
         self.base.as_ref().and_then(|base| base.label.as_deref())
     }
@@ -96,7 +96,10 @@ impl<A: HalApi> ComputePass<A> {
 
 impl<A: HalApi> fmt::Debug for ComputePass<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ComputePass {{ parent: {:?} }}", self.parent_id())
+        match self.parent {
+            Some(ref cmd_buf) => write!(f, "ComputePass {{ parent: {} }}", cmd_buf.error_ident()),
+            None => write!(f, "ComputePass {{ parent: None }}"),
+        }
     }
 }
 
@@ -135,13 +138,17 @@ struct ArcComputePassDescriptor<'a, A: HalApi> {
     pub timestamp_writes: Option<ArcComputePassTimestampWrites<A>>,
 }
 
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum DispatchError {
     #[error("Compute pipeline must be set")]
     MissingPipeline,
-    #[error("Incompatible bind group at index {index} in the current compute pipeline")]
-    IncompatibleBindGroup { index: u32, diff: Vec<String> },
+    #[error("Bind group at index {index} is incompatible with the current set {pipeline}")]
+    IncompatibleBindGroup {
+        index: u32,
+        pipeline: ResourceErrorIdent,
+        diff: Vec<String>,
+    },
     #[error(
         "Each current dispatch group size dimension ({current:?}) must be less or equal to {limit}"
     )]
@@ -159,26 +166,26 @@ pub enum ComputePassErrorInner {
     Encoder(#[from] CommandEncoderError),
     #[error("Parent encoder is invalid")]
     InvalidParentEncoder,
-    #[error("Bind group at index {0:?} is invalid")]
-    InvalidBindGroup(u32),
+    #[error("BindGroupId {0:?} is invalid")]
+    InvalidBindGroupId(id::BindGroupId),
     #[error("Bind group index {index} is greater than the device's requested `max_bind_group` limit {max}")]
     BindGroupIndexOutOfRange { index: u32, max: u32 },
     #[error("Compute pipeline {0:?} is invalid")]
     InvalidPipeline(id::ComputePipelineId),
     #[error("QuerySet {0:?} is invalid")]
     InvalidQuerySet(id::QuerySetId),
-    #[error("Indirect buffer {0:?} is invalid or destroyed")]
-    InvalidIndirectBuffer(id::BufferId),
+    #[error(transparent)]
+    DestroyedResource(#[from] DestroyedResourceError),
     #[error("Indirect buffer uses bytes {offset}..{end_offset} which overruns indirect buffer of size {buffer_size}")]
     IndirectBufferOverrun {
         offset: u64,
         end_offset: u64,
         buffer_size: u64,
     },
-    #[error("Buffer {0:?} is invalid or destroyed")]
-    InvalidBuffer(id::BufferId),
+    #[error("BufferId {0:?} is invalid")]
+    InvalidBufferId(id::BufferId),
     #[error(transparent)]
-    ResourceUsageConflict(#[from] UsageConflict),
+    ResourceUsageCompatibility(#[from] ResourceUsageCompatibilityError),
     #[error(transparent)]
     MissingBufferUsage(#[from] MissingBufferUsageError),
     #[error("Cannot pop debug group, because number of pushed debug groups is zero")]
@@ -211,9 +218,6 @@ impl PrettyError for ComputePassErrorInner {
         match *self {
             Self::InvalidPipeline(id) => {
                 fmt.compute_pipeline_label(&id);
-            }
-            Self::InvalidIndirectBuffer(id) => {
-                fmt.buffer_label(&id);
             }
             Self::Dispatch(DispatchError::IncompatibleBindGroup { ref diff, .. }) => {
                 for d in diff {
@@ -254,42 +258,60 @@ where
     }
 }
 
-struct State<'a, A: HalApi> {
+struct State<'scope, 'snatch_guard, 'cmd_buf, 'raw_encoder, A: HalApi> {
     binder: Binder<A>,
-    pipeline: Option<id::ComputePipelineId>,
-    scope: UsageScope<'a, A>,
+    pipeline: Option<Arc<ComputePipeline<A>>>,
+    scope: UsageScope<'scope, A>,
     debug_scope_depth: u32,
+
+    snatch_guard: SnatchGuard<'snatch_guard>,
+
+    device: &'cmd_buf Arc<Device<A>>,
+
+    raw_encoder: &'raw_encoder mut A::CommandEncoder,
+
+    tracker: &'cmd_buf mut Tracker<A>,
+    buffer_memory_init_actions: &'cmd_buf mut Vec<BufferInitTrackerAction<A>>,
+    texture_memory_actions: &'cmd_buf mut CommandBufferTextureMemoryActions<A>,
+
+    temp_offsets: Vec<u32>,
+    dynamic_offset_count: usize,
+    string_offset: usize,
+    active_query: Option<(Arc<resource::QuerySet<A>>, u32)>,
+
+    intermediate_trackers: Tracker<A>,
+
+    /// Immediate texture inits required because of prior discards. Need to
+    /// be inserted before texture reads.
+    pending_discard_init_fixups: SurfacesInDiscardState<A>,
 }
 
-impl<'a, A: HalApi> State<'a, A> {
+impl<'scope, 'snatch_guard, 'cmd_buf, 'raw_encoder, A: HalApi>
+    State<'scope, 'snatch_guard, 'cmd_buf, 'raw_encoder, A>
+{
     fn is_ready(&self) -> Result<(), DispatchError> {
-        let bind_mask = self.binder.invalid_mask();
-        if bind_mask != 0 {
-            //let (expected, provided) = self.binder.entries[index as usize].info();
-            let index = bind_mask.trailing_zeros();
-
-            return Err(DispatchError::IncompatibleBindGroup {
-                index,
-                diff: self.binder.bgl_diff(),
-            });
+        if let Some(pipeline) = self.pipeline.as_ref() {
+            let bind_mask = self.binder.invalid_mask();
+            if bind_mask != 0 {
+                return Err(DispatchError::IncompatibleBindGroup {
+                    index: bind_mask.trailing_zeros(),
+                    pipeline: pipeline.error_ident(),
+                    diff: self.binder.bgl_diff(),
+                });
+            }
+            self.binder.check_late_buffer_bindings()?;
+            Ok(())
+        } else {
+            Err(DispatchError::MissingPipeline)
         }
-        if self.pipeline.is_none() {
-            return Err(DispatchError::MissingPipeline);
-        }
-        self.binder.check_late_buffer_bindings()?;
-
-        Ok(())
     }
 
     // `extra_buffer` is there to represent the indirect buffer that is also
     // part of the usage scope.
     fn flush_states(
         &mut self,
-        raw_encoder: &mut A::CommandEncoder,
-        base_trackers: &mut Tracker<A>,
         indirect_buffer: Option<TrackerIndex>,
-        snatch_guard: &SnatchGuard,
-    ) -> Result<(), UsageConflict> {
+    ) -> Result<(), ResourceUsageCompatibilityError> {
         for bind_group in self.binder.list_active() {
             unsafe { self.scope.merge_bind_group(&bind_group.used)? };
             // Note: stateless trackers are not merged: the lifetime reference
@@ -298,21 +320,25 @@ impl<'a, A: HalApi> State<'a, A> {
 
         for bind_group in self.binder.list_active() {
             unsafe {
-                base_trackers
+                self.intermediate_trackers
                     .set_and_remove_from_usage_scope_sparse(&mut self.scope, &bind_group.used)
             }
         }
 
         // Add the state of the indirect buffer if it hasn't been hit before.
         unsafe {
-            base_trackers
+            self.intermediate_trackers
                 .buffers
                 .set_and_remove_from_usage_scope_sparse(&mut self.scope.buffers, indirect_buffer);
         }
 
         log::trace!("Encoding dispatch barriers");
 
-        CommandBuffer::drain_barriers(raw_encoder, base_trackers, snatch_guard);
+        CommandBuffer::drain_barriers(
+            self.raw_encoder,
+            &mut self.intermediate_trackers,
+            &self.snatch_guard,
+        );
         Ok(())
     }
 }
@@ -384,19 +410,22 @@ impl Global {
         &self,
         pass: &mut ComputePass<A>,
     ) -> Result<(), ComputePassError> {
-        let scope = PassErrorScope::Pass(pass.parent_id());
-        let Some(parent) = pass.parent.as_ref() else {
-            return Err(ComputePassErrorInner::InvalidParentEncoder).map_pass_err(scope);
-        };
+        let cmd_buf = pass
+            .parent
+            .as_ref()
+            .ok_or(ComputePassErrorInner::InvalidParentEncoder)
+            .map_pass_err(PassErrorScope::Pass(None))?;
 
-        parent.unlock_encoder().map_pass_err(scope)?;
+        let scope = PassErrorScope::Pass(Some(cmd_buf.as_info().id()));
+
+        cmd_buf.unlock_encoder().map_pass_err(scope)?;
 
         let base = pass
             .base
             .take()
             .ok_or(ComputePassErrorInner::PassEnded)
             .map_pass_err(scope)?;
-        self.compute_pass_end_impl(parent, base, pass.timestamp_writes.take())
+        self.compute_pass_end_impl(cmd_buf, base, pass.timestamp_writes.take())
     }
 
     #[doc(hidden)]
@@ -477,9 +506,6 @@ impl Global {
 
         let encoder = &mut cmd_buf_data.encoder;
         let status = &mut cmd_buf_data.status;
-        let tracker = &mut cmd_buf_data.trackers;
-        let buffer_memory_init_actions = &mut cmd_buf_data.buffer_memory_init_actions;
-        let texture_memory_actions = &mut cmd_buf_data.texture_memory_actions;
 
         // We automatically keep extending command buffers over time, and because
         // we want to insert a command buffer _before_ what we're about to record,
@@ -487,32 +513,47 @@ impl Global {
         encoder.close().map_pass_err(pass_scope)?;
         // will be reset to true if recording is done without errors
         *status = CommandEncoderStatus::Error;
-        let raw = encoder.open().map_pass_err(pass_scope)?;
+        let raw_encoder = encoder.open().map_pass_err(pass_scope)?;
 
         let mut state = State {
             binder: Binder::new(),
             pipeline: None,
             scope: device.new_usage_scope(),
             debug_scope_depth: 0,
+
+            snatch_guard: device.snatchable_lock.read(),
+
+            device,
+            raw_encoder,
+            tracker: &mut cmd_buf_data.trackers,
+            buffer_memory_init_actions: &mut cmd_buf_data.buffer_memory_init_actions,
+            texture_memory_actions: &mut cmd_buf_data.texture_memory_actions,
+
+            temp_offsets: Vec::new(),
+            dynamic_offset_count: 0,
+            string_offset: 0,
+            active_query: None,
+
+            intermediate_trackers: Tracker::new(),
+
+            pending_discard_init_fixups: SurfacesInDiscardState::new(),
         };
-        let mut temp_offsets = Vec::new();
-        let mut dynamic_offset_count = 0;
-        let mut string_offset = 0;
-        let mut active_query = None;
 
-        let snatch_guard = device.snatchable_lock.read();
-
-        let indices = &device.tracker_indices;
-        tracker.buffers.set_size(indices.buffers.size());
-        tracker.textures.set_size(indices.textures.size());
-        tracker.bind_groups.set_size(indices.bind_groups.size());
-        tracker
+        let indices = &state.device.tracker_indices;
+        state.tracker.buffers.set_size(indices.buffers.size());
+        state.tracker.textures.set_size(indices.textures.size());
+        state
+            .tracker
+            .bind_groups
+            .set_size(indices.bind_groups.size());
+        state
+            .tracker
             .compute_pipelines
             .set_size(indices.compute_pipelines.size());
-        tracker.query_sets.set_size(indices.query_sets.size());
+        state.tracker.query_sets.set_size(indices.query_sets.size());
 
         let timestamp_writes = if let Some(tw) = timestamp_writes.take() {
-            let query_set = tracker.query_sets.insert_single(tw.query_set);
+            let query_set = state.tracker.query_sets.insert_single(tw.query_set);
 
             // Unlike in render passes we can't delay resetting the query sets since
             // there is no auxiliary pass.
@@ -529,7 +570,9 @@ impl Global {
             // But no point in erroring over that nuance here!
             if let Some(range) = range {
                 unsafe {
-                    raw.reset_queries(query_set.raw.as_ref().unwrap(), range);
+                    state
+                        .raw_encoder
+                        .reset_queries(query_set.raw.as_ref().unwrap(), range);
                 }
             }
 
@@ -542,24 +585,14 @@ impl Global {
             None
         };
 
-        let discard_hal_labels = self
-            .instance
-            .flags
-            .contains(wgt::InstanceFlags::DISCARD_HAL_LABELS);
         let hal_desc = hal::ComputePassDescriptor {
             label: hal_label(base.label.as_deref(), self.instance.flags),
             timestamp_writes,
         };
 
         unsafe {
-            raw.begin_compute_pass(&hal_desc);
+            state.raw_encoder.begin_compute_pass(&hal_desc);
         }
-
-        let mut intermediate_trackers = Tracker::<A>::new();
-
-        // Immediate texture inits required because of prior discards. Need to
-        // be inserted before texture reads.
-        let mut pending_discard_init_fixups = SurfacesInDiscardState::new();
 
         // TODO: We should be draining the commands here, avoiding extra copies in the process.
         //       (A command encoder can't be executed twice!)
@@ -570,138 +603,20 @@ impl Global {
                     num_dynamic_offsets,
                     bind_group,
                 } => {
-                    let scope = PassErrorScope::SetBindGroup(bind_group.as_info().id());
-
-                    bind_group.same_device_as(cmd_buf).map_pass_err(scope)?;
-
-                    let max_bind_groups = cmd_buf.limits.max_bind_groups;
-                    if index >= max_bind_groups {
-                        return Err(ComputePassErrorInner::BindGroupIndexOutOfRange {
-                            index,
-                            max: max_bind_groups,
-                        })
-                        .map_pass_err(scope);
-                    }
-
-                    temp_offsets.clear();
-                    temp_offsets.extend_from_slice(
-                        &base.dynamic_offsets
-                            [dynamic_offset_count..dynamic_offset_count + num_dynamic_offsets],
-                    );
-                    dynamic_offset_count += num_dynamic_offsets;
-
-                    let bind_group = tracker.bind_groups.insert_single(bind_group);
-                    bind_group
-                        .validate_dynamic_bindings(index, &temp_offsets, &cmd_buf.limits)
-                        .map_pass_err(scope)?;
-
-                    buffer_memory_init_actions.extend(
-                        bind_group.used_buffer_ranges.iter().filter_map(|action| {
-                            action
-                                .buffer
-                                .initialization_status
-                                .read()
-                                .check_action(action)
-                        }),
-                    );
-
-                    for action in bind_group.used_texture_ranges.iter() {
-                        pending_discard_init_fixups
-                            .extend(texture_memory_actions.register_init_action(action));
-                    }
-
-                    let pipeline_layout = state.binder.pipeline_layout.clone();
-                    let entries =
-                        state
-                            .binder
-                            .assign_group(index as usize, bind_group, &temp_offsets);
-                    if !entries.is_empty() && pipeline_layout.is_some() {
-                        let pipeline_layout = pipeline_layout.as_ref().unwrap().raw();
-                        for (i, e) in entries.iter().enumerate() {
-                            if let Some(group) = e.group.as_ref() {
-                                let raw_bg = group
-                                    .raw(&snatch_guard)
-                                    .ok_or(ComputePassErrorInner::InvalidBindGroup(i as u32))
-                                    .map_pass_err(scope)?;
-                                unsafe {
-                                    raw.set_bind_group(
-                                        pipeline_layout,
-                                        index + i as u32,
-                                        raw_bg,
-                                        &e.dynamic_offsets,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    let scope = PassErrorScope::SetBindGroup;
+                    set_bind_group(
+                        &mut state,
+                        cmd_buf,
+                        &base.dynamic_offsets,
+                        index,
+                        num_dynamic_offsets,
+                        bind_group,
+                    )
+                    .map_pass_err(scope)?;
                 }
                 ArcComputeCommand::SetPipeline(pipeline) => {
-                    let pipeline_id = pipeline.as_info().id();
-                    let scope = PassErrorScope::SetPipelineCompute(pipeline_id);
-
-                    pipeline.same_device_as(cmd_buf).map_pass_err(scope)?;
-
-                    state.pipeline = Some(pipeline_id);
-
-                    let pipeline = tracker.compute_pipelines.insert_single(pipeline);
-
-                    unsafe {
-                        raw.set_compute_pipeline(pipeline.raw());
-                    }
-
-                    // Rebind resources
-                    if state.binder.pipeline_layout.is_none()
-                        || !state
-                            .binder
-                            .pipeline_layout
-                            .as_ref()
-                            .unwrap()
-                            .is_equal(&pipeline.layout)
-                    {
-                        let (start_index, entries) = state.binder.change_pipeline_layout(
-                            &pipeline.layout,
-                            &pipeline.late_sized_buffer_groups,
-                        );
-                        if !entries.is_empty() {
-                            for (i, e) in entries.iter().enumerate() {
-                                if let Some(group) = e.group.as_ref() {
-                                    let raw_bg = group
-                                        .raw(&snatch_guard)
-                                        .ok_or(ComputePassErrorInner::InvalidBindGroup(i as u32))
-                                        .map_pass_err(scope)?;
-                                    unsafe {
-                                        raw.set_bind_group(
-                                            pipeline.layout.raw(),
-                                            start_index as u32 + i as u32,
-                                            raw_bg,
-                                            &e.dynamic_offsets,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Clear push constant ranges
-                        let non_overlapping = super::bind::compute_nonoverlapping_ranges(
-                            &pipeline.layout.push_constant_ranges,
-                        );
-                        for range in non_overlapping {
-                            let offset = range.range.start;
-                            let size_bytes = range.range.end - offset;
-                            super::push_constant_clear(
-                                offset,
-                                size_bytes,
-                                |clear_offset, clear_data| unsafe {
-                                    raw.set_push_constants(
-                                        pipeline.layout.raw(),
-                                        wgt::ShaderStages::COMPUTE,
-                                        clear_offset,
-                                        clear_data,
-                                    );
-                                },
-                            );
-                        }
-                    }
+                    let scope = PassErrorScope::SetPipelineCompute;
+                    set_pipeline(&mut state, cmd_buf, pipeline).map_pass_err(scope)?;
                 }
                 ArcComputeCommand::SetPushConstant {
                     offset,
@@ -709,182 +624,39 @@ impl Global {
                     values_offset,
                 } => {
                     let scope = PassErrorScope::SetPushConstant;
-
-                    let end_offset_bytes = offset + size_bytes;
-                    let values_end_offset =
-                        (values_offset + size_bytes / wgt::PUSH_CONSTANT_ALIGNMENT) as usize;
-                    let data_slice =
-                        &base.push_constant_data[(values_offset as usize)..values_end_offset];
-
-                    let pipeline_layout = state
-                        .binder
-                        .pipeline_layout
-                        .as_ref()
-                        //TODO: don't error here, lazily update the push constants
-                        .ok_or(ComputePassErrorInner::Dispatch(
-                            DispatchError::MissingPipeline,
-                        ))
-                        .map_pass_err(scope)?;
-
-                    pipeline_layout
-                        .validate_push_constant_ranges(
-                            wgt::ShaderStages::COMPUTE,
-                            offset,
-                            end_offset_bytes,
-                        )
-                        .map_pass_err(scope)?;
-
-                    unsafe {
-                        raw.set_push_constants(
-                            pipeline_layout.raw(),
-                            wgt::ShaderStages::COMPUTE,
-                            offset,
-                            data_slice,
-                        );
-                    }
+                    set_push_constant(
+                        &mut state,
+                        &base.push_constant_data,
+                        offset,
+                        size_bytes,
+                        values_offset,
+                    )
+                    .map_pass_err(scope)?;
                 }
                 ArcComputeCommand::Dispatch(groups) => {
-                    let scope = PassErrorScope::Dispatch {
-                        indirect: false,
-                        pipeline: state.pipeline,
-                    };
-                    state.is_ready().map_pass_err(scope)?;
-
-                    state
-                        .flush_states(raw, &mut intermediate_trackers, None, &snatch_guard)
-                        .map_pass_err(scope)?;
-
-                    let groups_size_limit = cmd_buf.limits.max_compute_workgroups_per_dimension;
-
-                    if groups[0] > groups_size_limit
-                        || groups[1] > groups_size_limit
-                        || groups[2] > groups_size_limit
-                    {
-                        return Err(ComputePassErrorInner::Dispatch(
-                            DispatchError::InvalidGroupSize {
-                                current: groups,
-                                limit: groups_size_limit,
-                            },
-                        ))
-                        .map_pass_err(scope);
-                    }
-
-                    unsafe {
-                        raw.dispatch(groups);
-                    }
+                    let scope = PassErrorScope::Dispatch { indirect: false };
+                    dispatch(&mut state, groups).map_pass_err(scope)?;
                 }
                 ArcComputeCommand::DispatchIndirect { buffer, offset } => {
-                    let buffer_id = buffer.as_info().id();
-                    let scope = PassErrorScope::Dispatch {
-                        indirect: true,
-                        pipeline: state.pipeline,
-                    };
-
-                    buffer.same_device_as(cmd_buf).map_pass_err(scope)?;
-
-                    state.is_ready().map_pass_err(scope)?;
-
-                    device
-                        .require_downlevel_flags(wgt::DownlevelFlags::INDIRECT_EXECUTION)
-                        .map_pass_err(scope)?;
-
-                    state
-                        .scope
-                        .buffers
-                        .insert_merge_single(buffer.clone(), hal::BufferUses::INDIRECT)
-                        .map_pass_err(scope)?;
-                    check_buffer_usage(buffer_id, buffer.usage, wgt::BufferUsages::INDIRECT)
-                        .map_pass_err(scope)?;
-
-                    let end_offset = offset + mem::size_of::<wgt::DispatchIndirectArgs>() as u64;
-                    if end_offset > buffer.size {
-                        return Err(ComputePassErrorInner::IndirectBufferOverrun {
-                            offset,
-                            end_offset,
-                            buffer_size: buffer.size,
-                        })
-                        .map_pass_err(scope);
-                    }
-
-                    let buf_raw = buffer
-                        .raw
-                        .get(&snatch_guard)
-                        .ok_or(ComputePassErrorInner::InvalidIndirectBuffer(buffer_id))
-                        .map_pass_err(scope)?;
-
-                    let stride = 3 * 4; // 3 integers, x/y/z group size
-
-                    buffer_memory_init_actions.extend(
-                        buffer.initialization_status.read().create_action(
-                            &buffer,
-                            offset..(offset + stride),
-                            MemoryInitKind::NeedsInitializedMemory,
-                        ),
-                    );
-
-                    state
-                        .flush_states(
-                            raw,
-                            &mut intermediate_trackers,
-                            Some(buffer.as_info().tracker_index()),
-                            &snatch_guard,
-                        )
-                        .map_pass_err(scope)?;
-                    unsafe {
-                        raw.dispatch_indirect(buf_raw, offset);
-                    }
+                    let scope = PassErrorScope::Dispatch { indirect: true };
+                    dispatch_indirect(&mut state, cmd_buf, buffer, offset).map_pass_err(scope)?;
                 }
                 ArcComputeCommand::PushDebugGroup { color: _, len } => {
-                    state.debug_scope_depth += 1;
-                    if !discard_hal_labels {
-                        let label =
-                            str::from_utf8(&base.string_data[string_offset..string_offset + len])
-                                .unwrap();
-                        unsafe {
-                            raw.begin_debug_marker(label);
-                        }
-                    }
-                    string_offset += len;
+                    push_debug_group(&mut state, &base.string_data, len);
                 }
                 ArcComputeCommand::PopDebugGroup => {
                     let scope = PassErrorScope::PopDebugGroup;
-
-                    if state.debug_scope_depth == 0 {
-                        return Err(ComputePassErrorInner::InvalidPopDebugGroup)
-                            .map_pass_err(scope);
-                    }
-                    state.debug_scope_depth -= 1;
-                    if !discard_hal_labels {
-                        unsafe {
-                            raw.end_debug_marker();
-                        }
-                    }
+                    pop_debug_group(&mut state).map_pass_err(scope)?;
                 }
                 ArcComputeCommand::InsertDebugMarker { color: _, len } => {
-                    if !discard_hal_labels {
-                        let label =
-                            str::from_utf8(&base.string_data[string_offset..string_offset + len])
-                                .unwrap();
-                        unsafe { raw.insert_debug_marker(label) }
-                    }
-                    string_offset += len;
+                    insert_debug_marker(&mut state, &base.string_data, len);
                 }
                 ArcComputeCommand::WriteTimestamp {
                     query_set,
                     query_index,
                 } => {
                     let scope = PassErrorScope::WriteTimestamp;
-
-                    query_set.same_device_as(cmd_buf).map_pass_err(scope)?;
-
-                    device
-                        .require_features(wgt::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
-                        .map_pass_err(scope)?;
-
-                    let query_set = tracker.query_sets.insert_single(query_set);
-
-                    query_set
-                        .validate_and_write_timestamp(raw, query_index, None)
+                    write_timestamp(&mut state, cmd_buf, query_set, query_index)
                         .map_pass_err(scope)?;
                 }
                 ArcComputeCommand::BeginPipelineStatisticsQuery {
@@ -892,34 +664,40 @@ impl Global {
                     query_index,
                 } => {
                     let scope = PassErrorScope::BeginPipelineStatisticsQuery;
-
-                    query_set.same_device_as(cmd_buf).map_pass_err(scope)?;
-
-                    let query_set = tracker.query_sets.insert_single(query_set);
-
                     validate_and_begin_pipeline_statistics_query(
-                        query_set.clone(),
-                        raw,
+                        query_set,
+                        state.raw_encoder,
+                        &mut state.tracker.query_sets,
+                        cmd_buf,
                         query_index,
                         None,
-                        &mut active_query,
+                        &mut state.active_query,
                     )
                     .map_pass_err(scope)?;
                 }
                 ArcComputeCommand::EndPipelineStatisticsQuery => {
                     let scope = PassErrorScope::EndPipelineStatisticsQuery;
-                    end_pipeline_statistics_query(raw, &mut active_query).map_pass_err(scope)?;
+                    end_pipeline_statistics_query(state.raw_encoder, &mut state.active_query)
+                        .map_pass_err(scope)?;
                 }
             }
         }
 
         unsafe {
-            raw.end_compute_pass();
+            state.raw_encoder.end_compute_pass();
         }
 
         // We've successfully recorded the compute pass, bring the
         // command buffer out of the error state.
         *status = CommandEncoderStatus::Recording;
+
+        let State {
+            snatch_guard,
+            tracker,
+            intermediate_trackers,
+            pending_discard_init_fixups,
+            ..
+        } = state;
 
         // Stop the current command buffer.
         encoder.close().map_pass_err(pass_scope)?;
@@ -948,6 +726,312 @@ impl Global {
     }
 }
 
+fn set_bind_group<A: HalApi>(
+    state: &mut State<A>,
+    cmd_buf: &CommandBuffer<A>,
+    dynamic_offsets: &[DynamicOffset],
+    index: u32,
+    num_dynamic_offsets: usize,
+    bind_group: Arc<BindGroup<A>>,
+) -> Result<(), ComputePassErrorInner> {
+    bind_group.same_device_as(cmd_buf)?;
+
+    let max_bind_groups = state.device.limits.max_bind_groups;
+    if index >= max_bind_groups {
+        return Err(ComputePassErrorInner::BindGroupIndexOutOfRange {
+            index,
+            max: max_bind_groups,
+        });
+    }
+
+    state.temp_offsets.clear();
+    state.temp_offsets.extend_from_slice(
+        &dynamic_offsets
+            [state.dynamic_offset_count..state.dynamic_offset_count + num_dynamic_offsets],
+    );
+    state.dynamic_offset_count += num_dynamic_offsets;
+
+    let bind_group = state.tracker.bind_groups.insert_single(bind_group);
+    bind_group.validate_dynamic_bindings(index, &state.temp_offsets)?;
+
+    state
+        .buffer_memory_init_actions
+        .extend(bind_group.used_buffer_ranges.iter().filter_map(|action| {
+            action
+                .buffer
+                .initialization_status
+                .read()
+                .check_action(action)
+        }));
+
+    for action in bind_group.used_texture_ranges.iter() {
+        state
+            .pending_discard_init_fixups
+            .extend(state.texture_memory_actions.register_init_action(action));
+    }
+
+    let pipeline_layout = state.binder.pipeline_layout.clone();
+    let entries = state
+        .binder
+        .assign_group(index as usize, bind_group, &state.temp_offsets);
+    if !entries.is_empty() && pipeline_layout.is_some() {
+        let pipeline_layout = pipeline_layout.as_ref().unwrap().raw();
+        for (i, e) in entries.iter().enumerate() {
+            if let Some(group) = e.group.as_ref() {
+                let raw_bg = group.try_raw(&state.snatch_guard)?;
+                unsafe {
+                    state.raw_encoder.set_bind_group(
+                        pipeline_layout,
+                        index + i as u32,
+                        raw_bg,
+                        &e.dynamic_offsets,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_pipeline<A: HalApi>(
+    state: &mut State<A>,
+    cmd_buf: &CommandBuffer<A>,
+    pipeline: Arc<ComputePipeline<A>>,
+) -> Result<(), ComputePassErrorInner> {
+    pipeline.same_device_as(cmd_buf)?;
+
+    state.pipeline = Some(pipeline.clone());
+
+    let pipeline = state.tracker.compute_pipelines.insert_single(pipeline);
+
+    unsafe {
+        state.raw_encoder.set_compute_pipeline(pipeline.raw());
+    }
+
+    // Rebind resources
+    if state.binder.pipeline_layout.is_none()
+        || !state
+            .binder
+            .pipeline_layout
+            .as_ref()
+            .unwrap()
+            .is_equal(&pipeline.layout)
+    {
+        let (start_index, entries) = state
+            .binder
+            .change_pipeline_layout(&pipeline.layout, &pipeline.late_sized_buffer_groups);
+        if !entries.is_empty() {
+            for (i, e) in entries.iter().enumerate() {
+                if let Some(group) = e.group.as_ref() {
+                    let raw_bg = group.try_raw(&state.snatch_guard)?;
+                    unsafe {
+                        state.raw_encoder.set_bind_group(
+                            pipeline.layout.raw(),
+                            start_index as u32 + i as u32,
+                            raw_bg,
+                            &e.dynamic_offsets,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Clear push constant ranges
+        let non_overlapping =
+            super::bind::compute_nonoverlapping_ranges(&pipeline.layout.push_constant_ranges);
+        for range in non_overlapping {
+            let offset = range.range.start;
+            let size_bytes = range.range.end - offset;
+            super::push_constant_clear(offset, size_bytes, |clear_offset, clear_data| unsafe {
+                state.raw_encoder.set_push_constants(
+                    pipeline.layout.raw(),
+                    wgt::ShaderStages::COMPUTE,
+                    clear_offset,
+                    clear_data,
+                );
+            });
+        }
+    }
+    Ok(())
+}
+
+fn set_push_constant<A: HalApi>(
+    state: &mut State<A>,
+    push_constant_data: &[u32],
+    offset: u32,
+    size_bytes: u32,
+    values_offset: u32,
+) -> Result<(), ComputePassErrorInner> {
+    let end_offset_bytes = offset + size_bytes;
+    let values_end_offset = (values_offset + size_bytes / wgt::PUSH_CONSTANT_ALIGNMENT) as usize;
+    let data_slice = &push_constant_data[(values_offset as usize)..values_end_offset];
+
+    let pipeline_layout = state
+        .binder
+        .pipeline_layout
+        .as_ref()
+        //TODO: don't error here, lazily update the push constants
+        .ok_or(ComputePassErrorInner::Dispatch(
+            DispatchError::MissingPipeline,
+        ))?;
+
+    pipeline_layout.validate_push_constant_ranges(
+        wgt::ShaderStages::COMPUTE,
+        offset,
+        end_offset_bytes,
+    )?;
+
+    unsafe {
+        state.raw_encoder.set_push_constants(
+            pipeline_layout.raw(),
+            wgt::ShaderStages::COMPUTE,
+            offset,
+            data_slice,
+        );
+    }
+    Ok(())
+}
+
+fn dispatch<A: HalApi>(
+    state: &mut State<A>,
+    groups: [u32; 3],
+) -> Result<(), ComputePassErrorInner> {
+    state.is_ready()?;
+
+    state.flush_states(None)?;
+
+    let groups_size_limit = state.device.limits.max_compute_workgroups_per_dimension;
+
+    if groups[0] > groups_size_limit
+        || groups[1] > groups_size_limit
+        || groups[2] > groups_size_limit
+    {
+        return Err(ComputePassErrorInner::Dispatch(
+            DispatchError::InvalidGroupSize {
+                current: groups,
+                limit: groups_size_limit,
+            },
+        ));
+    }
+
+    unsafe {
+        state.raw_encoder.dispatch(groups);
+    }
+    Ok(())
+}
+
+fn dispatch_indirect<A: HalApi>(
+    state: &mut State<A>,
+    cmd_buf: &CommandBuffer<A>,
+    buffer: Arc<Buffer<A>>,
+    offset: u64,
+) -> Result<(), ComputePassErrorInner> {
+    buffer.same_device_as(cmd_buf)?;
+
+    state.is_ready()?;
+
+    state
+        .device
+        .require_downlevel_flags(wgt::DownlevelFlags::INDIRECT_EXECUTION)?;
+
+    state
+        .scope
+        .buffers
+        .merge_single(&buffer, hal::BufferUses::INDIRECT)?;
+    buffer.check_usage(wgt::BufferUsages::INDIRECT)?;
+
+    let end_offset = offset + mem::size_of::<wgt::DispatchIndirectArgs>() as u64;
+    if end_offset > buffer.size {
+        return Err(ComputePassErrorInner::IndirectBufferOverrun {
+            offset,
+            end_offset,
+            buffer_size: buffer.size,
+        });
+    }
+
+    let stride = 3 * 4; // 3 integers, x/y/z group size
+
+    state
+        .buffer_memory_init_actions
+        .extend(buffer.initialization_status.read().create_action(
+            &buffer,
+            offset..(offset + stride),
+            MemoryInitKind::NeedsInitializedMemory,
+        ));
+
+    state.flush_states(Some(buffer.as_info().tracker_index()))?;
+
+    let buf_raw = buffer.try_raw(&state.snatch_guard)?;
+    unsafe {
+        state.raw_encoder.dispatch_indirect(buf_raw, offset);
+    }
+    Ok(())
+}
+
+fn push_debug_group<A: HalApi>(state: &mut State<A>, string_data: &[u8], len: usize) {
+    state.debug_scope_depth += 1;
+    if !state
+        .device
+        .instance_flags
+        .contains(wgt::InstanceFlags::DISCARD_HAL_LABELS)
+    {
+        let label =
+            str::from_utf8(&string_data[state.string_offset..state.string_offset + len]).unwrap();
+        unsafe {
+            state.raw_encoder.begin_debug_marker(label);
+        }
+    }
+    state.string_offset += len;
+}
+
+fn pop_debug_group<A: HalApi>(state: &mut State<A>) -> Result<(), ComputePassErrorInner> {
+    if state.debug_scope_depth == 0 {
+        return Err(ComputePassErrorInner::InvalidPopDebugGroup);
+    }
+    state.debug_scope_depth -= 1;
+    if !state
+        .device
+        .instance_flags
+        .contains(wgt::InstanceFlags::DISCARD_HAL_LABELS)
+    {
+        unsafe {
+            state.raw_encoder.end_debug_marker();
+        }
+    }
+    Ok(())
+}
+
+fn insert_debug_marker<A: HalApi>(state: &mut State<A>, string_data: &[u8], len: usize) {
+    if !state
+        .device
+        .instance_flags
+        .contains(wgt::InstanceFlags::DISCARD_HAL_LABELS)
+    {
+        let label =
+            str::from_utf8(&string_data[state.string_offset..state.string_offset + len]).unwrap();
+        unsafe { state.raw_encoder.insert_debug_marker(label) }
+    }
+    state.string_offset += len;
+}
+
+fn write_timestamp<A: HalApi>(
+    state: &mut State<A>,
+    cmd_buf: &CommandBuffer<A>,
+    query_set: Arc<resource::QuerySet<A>>,
+    query_index: u32,
+) -> Result<(), ComputePassErrorInner> {
+    query_set.same_device_as(cmd_buf)?;
+
+    state
+        .device
+        .require_features(wgt::Features::TIMESTAMP_QUERY_INSIDE_PASSES)?;
+
+    let query_set = state.tracker.query_sets.insert_single(query_set);
+
+    query_set.validate_and_write_timestamp(state.raw_encoder, query_index, None)?;
+    Ok(())
+}
+
 // Recording a compute pass.
 impl Global {
     pub fn compute_pass_set_bind_group<A: HalApi>(
@@ -957,7 +1041,7 @@ impl Global {
         bind_group_id: id::BindGroupId,
         offsets: &[DynamicOffset],
     ) -> Result<(), ComputePassError> {
-        let scope = PassErrorScope::SetBindGroup(bind_group_id);
+        let scope = PassErrorScope::SetBindGroup;
         let base = pass
             .base
             .as_mut()
@@ -980,7 +1064,7 @@ impl Global {
             .bind_groups
             .read()
             .get_owned(bind_group_id)
-            .map_err(|_| ComputePassErrorInner::InvalidBindGroup(index))
+            .map_err(|_| ComputePassErrorInner::InvalidBindGroupId(bind_group_id))
             .map_pass_err(scope)?;
 
         base.commands.push(ArcComputeCommand::SetBindGroup {
@@ -999,7 +1083,7 @@ impl Global {
     ) -> Result<(), ComputePassError> {
         let redundant = pass.current_pipeline.set_and_check_redundant(pipeline_id);
 
-        let scope = PassErrorScope::SetPipelineCompute(pipeline_id);
+        let scope = PassErrorScope::SetPipelineCompute;
 
         let base = pass.base_mut(scope)?;
         if redundant {
@@ -1064,10 +1148,7 @@ impl Global {
         groups_y: u32,
         groups_z: u32,
     ) -> Result<(), ComputePassError> {
-        let scope = PassErrorScope::Dispatch {
-            indirect: false,
-            pipeline: pass.current_pipeline.last_state,
-        };
+        let scope = PassErrorScope::Dispatch { indirect: false };
 
         let base = pass.base_mut(scope)?;
         base.commands.push(ArcComputeCommand::<A>::Dispatch([
@@ -1084,17 +1165,13 @@ impl Global {
         offset: BufferAddress,
     ) -> Result<(), ComputePassError> {
         let hub = A::hub(self);
-        let scope = PassErrorScope::Dispatch {
-            indirect: true,
-            pipeline: pass.current_pipeline.last_state,
-        };
+        let scope = PassErrorScope::Dispatch { indirect: true };
         let base = pass.base_mut(scope)?;
 
         let buffer = hub
             .buffers
-            .read()
-            .get_owned(buffer_id)
-            .map_err(|_| ComputePassErrorInner::InvalidBuffer(buffer_id))
+            .get(buffer_id)
+            .map_err(|_| ComputePassErrorInner::InvalidBufferId(buffer_id))
             .map_pass_err(scope)?;
 
         base.commands

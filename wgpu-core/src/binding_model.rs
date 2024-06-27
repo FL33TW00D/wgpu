@@ -1,18 +1,18 @@
-#[cfg(feature = "trace")]
-use crate::device::trace;
 use crate::{
     device::{
         bgl, Device, DeviceError, MissingDownlevelFlags, MissingFeatures, SHADER_STAGE_COUNT,
     },
     error::{ErrorFormatter, PrettyError},
     hal_api::HalApi,
-    id::{BindGroupLayoutId, BufferId, SamplerId, TextureId, TextureViewId},
+    id::{BindGroupLayoutId, BufferId, SamplerId, TextureViewId},
     init_tracker::{BufferInitTrackerAction, TextureInitTrackerAction},
-    resource::{ParentDevice, Resource, ResourceInfo, ResourceType},
+    resource::{
+        DestroyedResourceError, MissingBufferUsageError, MissingTextureUsageError, ParentDevice,
+        Resource, ResourceErrorIdent, ResourceInfo, ResourceType,
+    },
     resource_log,
     snatch::{SnatchGuard, Snatchable},
-    track::{BindGroupStates, UsageConflict},
-    validation::{MissingBufferUsageError, MissingTextureUsageError},
+    track::{BindGroupStates, ResourceUsageCompatibilityError},
     Label,
 };
 
@@ -76,14 +76,14 @@ pub enum CreateBindGroupError {
     Device(#[from] DeviceError),
     #[error("Bind group layout is invalid")]
     InvalidLayout,
-    #[error("Buffer {0:?} is invalid or destroyed")]
-    InvalidBuffer(BufferId),
-    #[error("Texture view {0:?} is invalid")]
-    InvalidTextureView(TextureViewId),
-    #[error("Texture {0:?} is invalid")]
-    InvalidTexture(TextureId),
+    #[error("BufferId {0:?} is invalid")]
+    InvalidBufferId(BufferId),
+    #[error("Texture view Id {0:?} is invalid")]
+    InvalidTextureViewId(TextureViewId),
     #[error("Sampler {0:?} is invalid")]
     InvalidSampler(SamplerId),
+    #[error(transparent)]
+    DestroyedResource(#[from] DestroyedResourceError),
     #[error(
         "Binding count declared with at most {expected} items, but {actual} items were provided"
     )]
@@ -182,7 +182,7 @@ pub enum CreateBindGroupError {
     #[error("The adapter does not support read access for storages texture of format {0:?}")]
     StorageReadNotSupported(wgt::TextureFormat),
     #[error(transparent)]
-    ResourceUsageConflict(#[from] UsageConflict),
+    ResourceUsageCompatibility(#[from] ResourceUsageCompatibilityError),
 }
 
 impl PrettyError for CreateBindGroupError {
@@ -198,10 +198,7 @@ impl PrettyError for CreateBindGroupError {
             Self::BindingSizeTooSmall { buffer, .. } => {
                 fmt.buffer_label(&buffer);
             }
-            Self::InvalidBuffer(id) => {
-                fmt.buffer_label(&id);
-            }
-            Self::InvalidTextureView(id) => {
+            Self::InvalidTextureViewId(id) => {
                 fmt.texture_view_label(&id);
             }
             Self::InvalidSampler(id) => {
@@ -478,7 +475,6 @@ pub struct BindGroupLayout<A: HalApi> {
     #[allow(unused)]
     pub(crate) binding_count_validator: BindingTypeMaxCountValidator,
     pub(crate) info: ResourceInfo<BindGroupLayout<A>>,
-    pub(crate) label: String,
 }
 
 impl<A: HalApi> Drop for BindGroupLayout<A> {
@@ -487,12 +483,7 @@ impl<A: HalApi> Drop for BindGroupLayout<A> {
             self.device.bgl_pool.remove(&self.entries);
         }
         if let Some(raw) = self.raw.take() {
-            #[cfg(feature = "trace")]
-            if let Some(t) = self.device.trace.lock().as_mut() {
-                t.add(trace::Action::DestroyBindGroupLayout(self.info.id()));
-            }
-
-            resource_log!("Destroy raw BindGroupLayout {:?}", self.info.label());
+            resource_log!("Destroy raw {}", self.error_ident());
             unsafe {
                 use hal::Device;
                 self.device.raw().destroy_bind_group_layout(raw);
@@ -512,10 +503,6 @@ impl<A: HalApi> Resource for BindGroupLayout<A> {
 
     fn as_info_mut(&mut self) -> &mut ResourceInfo<Self> {
         &mut self.info
-    }
-
-    fn label(&self) -> &str {
-        &self.label
     }
 }
 
@@ -638,13 +625,7 @@ pub struct PipelineLayout<A: HalApi> {
 impl<A: HalApi> Drop for PipelineLayout<A> {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            resource_log!("Destroy raw PipelineLayout {:?}", self.info.label());
-
-            #[cfg(feature = "trace")]
-            if let Some(t) = self.device.trace.lock().as_mut() {
-                t.add(trace::Action::DestroyPipelineLayout(self.info.id()));
-            }
-
+            resource_log!("Destroy raw {}", self.error_ident());
             unsafe {
                 use hal::Device;
                 self.device.raw().destroy_pipeline_layout(raw);
@@ -790,19 +771,21 @@ pub enum BindingResource<'a> {
 #[non_exhaustive]
 pub enum BindError {
     #[error(
-        "Bind group {group} expects {expected} dynamic offset{s0}. However {actual} dynamic offset{s1} were provided.",
+        "{bind_group} {group} expects {expected} dynamic offset{s0}. However {actual} dynamic offset{s1} were provided.",
         s0 = if *.expected >= 2 { "s" } else { "" },
         s1 = if *.actual >= 2 { "s" } else { "" },
     )]
     MismatchedDynamicOffsetCount {
+        bind_group: ResourceErrorIdent,
         group: u32,
         actual: usize,
         expected: usize,
     },
     #[error(
-        "Dynamic binding index {idx} (targeting bind group {group}, binding {binding}) with value {offset}, does not respect device's requested `{limit_name}` limit: {alignment}"
+        "Dynamic binding index {idx} (targeting {bind_group} {group}, binding {binding}) with value {offset}, does not respect device's requested `{limit_name}` limit: {alignment}"
     )]
     UnalignedDynamicBinding {
+        bind_group: ResourceErrorIdent,
         idx: usize,
         group: u32,
         binding: u32,
@@ -811,10 +794,11 @@ pub enum BindError {
         limit_name: &'static str,
     },
     #[error(
-        "Dynamic binding offset index {idx} with offset {offset} would overrun the buffer bound to bind group {group} -> binding {binding}. \
+        "Dynamic binding offset index {idx} with offset {offset} would overrun the buffer bound to {bind_group} {group} -> binding {binding}. \
          Buffer size is {buffer_size} bytes, the binding binds bytes {binding_range:?}, meaning the maximum the binding can be offset is {maximum_dynamic_offset} bytes",
     )]
     DynamicBindingOutOfBounds {
+        bind_group: ResourceErrorIdent,
         idx: usize,
         group: u32,
         binding: u32,
@@ -879,13 +863,7 @@ pub struct BindGroup<A: HalApi> {
 impl<A: HalApi> Drop for BindGroup<A> {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            resource_log!("Destroy raw BindGroup {:?}", self.info.label());
-
-            #[cfg(feature = "trace")]
-            if let Some(t) = self.device.trace.lock().as_mut() {
-                t.add(trace::Action::DestroyBindGroup(self.info.id()));
-            }
-
+            resource_log!("Destroy raw {}", self.error_ident());
             unsafe {
                 use hal::Device;
                 self.device.raw().destroy_bind_group(raw);
@@ -895,25 +873,32 @@ impl<A: HalApi> Drop for BindGroup<A> {
 }
 
 impl<A: HalApi> BindGroup<A> {
-    pub(crate) fn raw(&self, guard: &SnatchGuard) -> Option<&A::BindGroup> {
+    pub(crate) fn try_raw<'a>(
+        &'a self,
+        guard: &'a SnatchGuard,
+    ) -> Result<&A::BindGroup, DestroyedResourceError> {
         // Clippy insist on writing it this way. The idea is to return None
         // if any of the raw buffer is not valid anymore.
         for buffer in &self.used_buffer_ranges {
-            let _ = buffer.buffer.raw(guard)?;
+            buffer.buffer.try_raw(guard)?;
         }
         for texture in &self.used_texture_ranges {
-            let _ = texture.texture.raw(guard)?;
+            texture.texture.try_raw(guard)?;
         }
-        self.raw.get(guard)
+
+        self.raw
+            .get(guard)
+            .ok_or_else(|| DestroyedResourceError(self.error_ident()))
     }
+
     pub(crate) fn validate_dynamic_bindings(
         &self,
         bind_group_index: u32,
         offsets: &[wgt::DynamicOffset],
-        limits: &wgt::Limits,
     ) -> Result<(), BindError> {
         if self.dynamic_binding_info.len() != offsets.len() {
             return Err(BindError::MismatchedDynamicOffsetCount {
+                bind_group: self.error_ident(),
                 group: bind_group_index,
                 expected: self.dynamic_binding_info.len(),
                 actual: offsets.len(),
@@ -926,9 +911,11 @@ impl<A: HalApi> BindGroup<A> {
             .zip(offsets.iter())
             .enumerate()
         {
-            let (alignment, limit_name) = buffer_binding_type_alignment(limits, info.binding_type);
+            let (alignment, limit_name) =
+                buffer_binding_type_alignment(&self.device.limits, info.binding_type);
             if offset as wgt::BufferAddress % alignment as u64 != 0 {
                 return Err(BindError::UnalignedDynamicBinding {
+                    bind_group: self.error_ident(),
                     group: bind_group_index,
                     binding: info.binding_idx,
                     idx,
@@ -940,6 +927,7 @@ impl<A: HalApi> BindGroup<A> {
 
             if offset as wgt::BufferAddress > info.maximum_dynamic_offset {
                 return Err(BindError::DynamicBindingOutOfBounds {
+                    bind_group: self.error_ident(),
                     group: bind_group_index,
                     binding: info.binding_idx,
                     idx,
