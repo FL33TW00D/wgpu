@@ -106,7 +106,7 @@ use crate::{
     hal_api::HalApi,
     lock::{rank, Mutex, RwLock},
     pipeline,
-    resource::{self, Resource, ResourceErrorIdent},
+    resource::{self, Labeled, ResourceErrorIdent},
     snatch::SnatchGuard,
 };
 
@@ -126,11 +126,7 @@ use wgt::strict_assert_ne;
 pub(crate) struct TrackerIndex(u32);
 
 impl TrackerIndex {
-    /// A dummy value to place in ResourceInfo for resources that are never tracked.
-    pub const INVALID: Self = TrackerIndex(u32::MAX);
-
     pub fn as_usize(self) -> usize {
-        debug_assert!(self != Self::INVALID);
         self.0 as usize
     }
 }
@@ -386,12 +382,6 @@ impl ResourceUsageCompatibilityError {
                 new_state,
             },
         }
-    }
-}
-
-impl crate::error::PrettyError for ResourceUsageCompatibilityError {
-    fn fmt_pretty(&self, fmt: &mut crate::error::ErrorFormatter) {
-        fmt.error(self);
     }
 }
 

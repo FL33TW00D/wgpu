@@ -89,19 +89,16 @@ use crate::{
         AttachmentData, Device, DeviceError, MissingDownlevelFlags, RenderPassContext,
         SHADER_STAGE_COUNT,
     },
-    error::{ErrorFormatter, PrettyError},
     hal_api::HalApi,
     hub::Hub,
     id,
     init_tracker::{BufferInitTrackerAction, MemoryInitKind, TextureInitTrackerAction},
     pipeline::{PipelineFlags, RenderPipeline, VertexStep},
-    resource::{
-        Buffer, DestroyedResourceError, ParentDevice, Resource, ResourceInfo, ResourceType,
-    },
+    resource::{Buffer, DestroyedResourceError, Labeled, ParentDevice, TrackingData},
     resource_log,
     snatch::SnatchGuard,
     track::RenderBundleScope,
-    Label,
+    Label, LabelHelpers,
 };
 use arrayvec::ArrayVec;
 
@@ -580,7 +577,8 @@ impl RenderBundleEncoder {
             buffer_memory_init_actions,
             texture_memory_init_actions,
             context: self.context,
-            info: ResourceInfo::new(&desc.label, Some(tracker_indices)),
+            label: desc.label.to_string(),
+            tracking_data: TrackingData::new(tracker_indices),
             discard_hal_labels,
         })
     }
@@ -662,7 +660,7 @@ fn set_pipeline<A: HalApi>(
 ) -> Result<(), RenderBundleErrorInner> {
     let pipeline = pipeline_guard
         .get(pipeline_id)
-        .map_err(|_| RenderCommandError::InvalidPipeline(pipeline_id))?;
+        .map_err(|_| RenderCommandError::InvalidPipelineId(pipeline_id))?;
 
     state.trackers.render_pipelines.write().add_single(pipeline);
 
@@ -949,11 +947,6 @@ pub enum ExecutionError {
     #[error("Using {0} in a render bundle is not implemented")]
     Unimplemented(&'static str),
 }
-impl PrettyError for ExecutionError {
-    fn fmt_pretty(&self, fmt: &mut ErrorFormatter) {
-        fmt.error(self);
-    }
-}
 
 pub type RenderBundleDescriptor<'a> = wgt::RenderBundleDescriptor<Label<'a>>;
 
@@ -972,7 +965,9 @@ pub struct RenderBundle<A: HalApi> {
     pub(super) buffer_memory_init_actions: Vec<BufferInitTrackerAction<A>>,
     pub(super) texture_memory_init_actions: Vec<TextureInitTrackerAction<A>>,
     pub(super) context: RenderPassContext,
-    pub(crate) info: ResourceInfo<RenderBundle<A>>,
+    /// The `label` from the descriptor used to create the resource.
+    label: String,
+    pub(crate) tracking_data: TrackingData,
     discard_hal_labels: bool,
 }
 
@@ -1182,25 +1177,11 @@ impl<A: HalApi> RenderBundle<A> {
     }
 }
 
-impl<A: HalApi> Resource for RenderBundle<A> {
-    const TYPE: ResourceType = "RenderBundle";
-
-    type Marker = id::markers::RenderBundle;
-
-    fn as_info(&self) -> &ResourceInfo<Self> {
-        &self.info
-    }
-
-    fn as_info_mut(&mut self) -> &mut ResourceInfo<Self> {
-        &mut self.info
-    }
-}
-
-impl<A: HalApi> ParentDevice<A> for RenderBundle<A> {
-    fn device(&self) -> &Arc<Device<A>> {
-        &self.device
-    }
-}
+crate::impl_resource_type!(RenderBundle);
+crate::impl_labeled!(RenderBundle);
+crate::impl_parent_device!(RenderBundle);
+crate::impl_storage_item!(RenderBundle);
+crate::impl_trackable!(RenderBundle);
 
 /// A render bundle's current index buffer state.
 ///
@@ -1608,14 +1589,6 @@ impl RenderBundleError {
             scope: PassErrorScope::Bundle,
             inner: e.into(),
         }
-    }
-}
-impl PrettyError for RenderBundleError {
-    fn fmt_pretty(&self, fmt: &mut ErrorFormatter) {
-        // This error is wrapper for the inner error,
-        // but the scope has useful labels
-        fmt.error(self);
-        self.scope.fmt_pretty(fmt);
     }
 }
 

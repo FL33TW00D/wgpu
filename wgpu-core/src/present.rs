@@ -9,10 +9,7 @@ When this texture is presented, we remove it from the device tracker as well as
 extract it from the hub.
 !*/
 
-use std::{
-    borrow::{Borrow, Cow},
-    sync::Arc,
-};
+use std::{borrow::Borrow, sync::Arc};
 
 #[cfg(feature = "trace")]
 use crate::device::trace::Action;
@@ -25,7 +22,7 @@ use crate::{
     hal_label, id,
     init_tracker::TextureInitTracker,
     lock::{rank, Mutex, RwLock},
-    resource::{self, ResourceInfo},
+    resource::{self, Trackable, TrackingData},
     snatch::Snatchable,
     track,
 };
@@ -227,10 +224,8 @@ impl Global {
                         layers: 0..1,
                         mips: 0..1,
                     },
-                    info: ResourceInfo::new(
-                        &Some(Cow::Borrowed("<Surface Texture>")),
-                        Some(device.tracker_indices.textures.clone()),
-                    ),
+                    label: String::from("<Surface Texture>"),
+                    tracking_data: TrackingData::new(device.tracker_indices.textures.clone()),
                     clear_mode: RwLock::new(
                         rank::TEXTURE_CLEAR_MODE,
                         resource::TextureClearMode::Surface {
@@ -331,7 +326,7 @@ impl Global {
                     .trackers
                     .lock()
                     .textures
-                    .remove(texture.info.tracker_index());
+                    .remove(texture.tracker_index());
                 let mut exclusive_snatch_guard = device.snatchable_lock.write();
                 let suf = A::surface_as_hal(&surface);
                 let mut inner = texture.inner_mut(&mut exclusive_snatch_guard);
@@ -425,7 +420,7 @@ impl Global {
                     .trackers
                     .lock()
                     .textures
-                    .remove(texture.info.tracker_index());
+                    .remove(texture.tracker_index());
                 let suf = A::surface_as_hal(&surface);
                 let exclusive_snatch_guard = device.snatchable_lock.write();
                 match texture.inner.snatch(exclusive_snatch_guard).unwrap() {

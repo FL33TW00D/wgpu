@@ -9,7 +9,9 @@ use crate::{
     hal_api::HalApi,
     id,
     init_tracker::MemoryInitKind,
-    resource::{DestroyedResourceError, ParentDevice, QuerySet},
+    resource::{
+        DestroyedResourceError, MissingBufferUsageError, ParentDevice, QuerySet, Trackable,
+    },
     track::{StatelessTracker, TrackerIndex},
     FastHashMap,
 };
@@ -33,7 +35,7 @@ impl<A: HalApi> QueryResetMap<A> {
     pub fn use_query_set(&mut self, query_set: &Arc<QuerySet<A>>, query: u32) -> bool {
         let vec_pair = self
             .map
-            .entry(query_set.info.tracker_index())
+            .entry(query_set.tracker_index())
             .or_insert_with(|| {
                 (
                     vec![false; query_set.desc.count as usize],
@@ -107,17 +109,8 @@ pub enum QueryError {
     InvalidBufferId(id::BufferId),
     #[error(transparent)]
     DestroyedResource(#[from] DestroyedResourceError),
-    #[error("QuerySet {0:?} is invalid or destroyed")]
-    InvalidQuerySet(id::QuerySetId),
-}
-
-impl crate::error::PrettyError for QueryError {
-    fn fmt_pretty(&self, fmt: &mut crate::error::ErrorFormatter) {
-        fmt.error(self);
-        if let Self::InvalidQuerySet(id) = *self {
-            fmt.query_set_label(&id)
-        }
-    }
+    #[error("QuerySetId {0:?} is invalid or destroyed")]
+    InvalidQuerySetId(id::QuerySetId),
 }
 
 /// Error encountered while trying to use queries
@@ -151,8 +144,8 @@ pub enum QueryUseError {
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum ResolveError {
-    #[error("Queries can only be resolved to buffers that contain the QUERY_RESOLVE usage")]
-    MissingBufferUsage,
+    #[error(transparent)]
+    MissingBufferUsage(#[from] MissingBufferUsageError),
     #[error("Resolve buffer offset has to be aligned to `QUERY_RESOLVE_BUFFER_ALIGNMENT")]
     BufferOffsetAlignment,
     #[error("Resolving queries {start_query}..{end_query} would overrun the query set of size {query_set_size}")]
@@ -356,7 +349,7 @@ impl Global {
         let query_set_guard = hub.query_sets.read();
         let query_set = query_set_guard
             .get(query_set_id)
-            .map_err(|_| QueryError::InvalidQuerySet(query_set_id))?;
+            .map_err(|_| QueryError::InvalidQuerySetId(query_set_id))?;
 
         tracker.query_sets.add_single(query_set);
 
@@ -403,7 +396,7 @@ impl Global {
         let query_set_guard = hub.query_sets.read();
         let query_set = query_set_guard
             .get(query_set_id)
-            .map_err(|_| QueryError::InvalidQuerySet(query_set_id))?;
+            .map_err(|_| QueryError::InvalidQuerySetId(query_set_id))?;
 
         tracker.query_sets.add_single(query_set);
 
@@ -424,9 +417,9 @@ impl Global {
 
         let dst_barrier = dst_pending.map(|pending| pending.into_hal(&dst_buffer, &snatch_guard));
 
-        if !dst_buffer.usage.contains(wgt::BufferUsages::QUERY_RESOLVE) {
-            return Err(ResolveError::MissingBufferUsage.into());
-        }
+        dst_buffer
+            .check_usage(wgt::BufferUsages::QUERY_RESOLVE)
+            .map_err(ResolveError::MissingBufferUsage)?;
 
         let end_query = start_query + query_count;
         if end_query > query_set.desc.count {

@@ -6,12 +6,11 @@ use crate::{
     device::{queue::Queue, resource::Device, DeviceDescriptor},
     global::Global,
     hal_api::HalApi,
-    id::markers,
-    id::{AdapterId, DeviceId, Id, Marker, QueueId, SurfaceId},
+    id::{markers, AdapterId, DeviceId, Id, Marker, QueueId, SurfaceId},
     lock::{rank, Mutex},
     present::Presentation,
-    resource::{Resource, ResourceInfo, ResourceType},
-    resource_log, LabelHelpers, DOWNLEVEL_WARNING_MESSAGE,
+    resource::ResourceType,
+    resource_log, DOWNLEVEL_WARNING_MESSAGE,
 };
 
 use wgt::{Backend, Backends, PowerPreference};
@@ -134,7 +133,6 @@ impl Instance {
 
 pub struct Surface {
     pub(crate) presentation: Mutex<Option<Presentation>>,
-    pub(crate) info: ResourceInfo<Surface>,
 
     #[cfg(vulkan)]
     pub vulkan: Option<HalSurface<hal::api::Vulkan>>,
@@ -146,18 +144,11 @@ pub struct Surface {
     pub gl: Option<HalSurface<hal::api::Gles>>,
 }
 
-impl Resource for Surface {
-    const TYPE: ResourceType = "Surface";
-
+impl ResourceType for Surface {
+    const TYPE: &'static str = "Surface";
+}
+impl crate::storage::StorageItem for Surface {
     type Marker = markers::Surface;
-
-    fn as_info(&self) -> &ResourceInfo<Self> {
-        &self.info
-    }
-
-    fn as_info_mut(&mut self) -> &mut ResourceInfo<Self> {
-        &mut self.info
-    }
 }
 
 impl Surface {
@@ -181,7 +172,6 @@ impl Surface {
 
 pub struct Adapter<A: HalApi> {
     pub(crate) raw: hal::ExposedAdapter<A>,
-    pub(crate) info: ResourceInfo<Adapter<A>>,
 }
 
 impl<A: HalApi> Adapter<A> {
@@ -198,10 +188,7 @@ impl<A: HalApi> Adapter<A> {
             .min_storage_buffer_offset_alignment
             .max(MIN_BUFFER_OFFSET_ALIGNMENT_LOWER_BOUND);
 
-        Self {
-            raw,
-            info: ResourceInfo::new(&None, None),
-        }
+        Self { raw }
     }
 
     pub fn is_surface_supported(&self, surface: &Surface) -> bool {
@@ -291,7 +278,7 @@ impl<A: HalApi> Adapter<A> {
         desc: &DeviceDescriptor,
         instance_flags: wgt::InstanceFlags,
         trace_path: Option<&std::path::Path>,
-    ) -> Result<(Device<A>, Queue<A>), RequestDeviceError> {
+    ) -> Result<(Arc<Device<A>>, Queue<A>), RequestDeviceError> {
         api_log!("Adapter::create_device");
 
         if let Ok(device) = Device::new(
@@ -302,10 +289,10 @@ impl<A: HalApi> Adapter<A> {
             trace_path,
             instance_flags,
         ) {
+            let device = Arc::new(device);
             let queue = Queue {
-                device: None,
+                device: device.clone(),
                 raw: Some(hal_device.queue),
-                info: ResourceInfo::new(&None, None),
             };
             return Ok((device, queue));
         }
@@ -317,7 +304,7 @@ impl<A: HalApi> Adapter<A> {
         desc: &DeviceDescriptor,
         instance_flags: wgt::InstanceFlags,
         trace_path: Option<&std::path::Path>,
-    ) -> Result<(Device<A>, Queue<A>), RequestDeviceError> {
+    ) -> Result<(Arc<Device<A>>, Queue<A>), RequestDeviceError> {
         // Verify all features were exposed by the adapter
         if !self.raw.features.contains(desc.required_features) {
             return Err(RequestDeviceError::UnsupportedFeature(
@@ -373,19 +360,8 @@ impl<A: HalApi> Adapter<A> {
     }
 }
 
-impl<A: HalApi> Resource for Adapter<A> {
-    const TYPE: ResourceType = "Adapter";
-
-    type Marker = markers::Adapter;
-
-    fn as_info(&self) -> &ResourceInfo<Self> {
-        &self.info
-    }
-
-    fn as_info_mut(&mut self) -> &mut ResourceInfo<Self> {
-        &mut self.info
-    }
-}
+crate::impl_resource_type!(Adapter);
+crate::impl_storage_item!(Adapter);
 
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
@@ -528,7 +504,6 @@ impl Global {
 
         let surface = Surface {
             presentation: Mutex::new(rank::SURFACE_PRESENTATION, None),
-            info: ResourceInfo::new(&None, None),
 
             #[cfg(vulkan)]
             vulkan: init::<hal::api::Vulkan>(
@@ -592,7 +567,6 @@ impl Global {
 
         let surface = Surface {
             presentation: Mutex::new(rank::SURFACE_PRESENTATION, None),
-            info: ResourceInfo::new(&None, None),
             metal: Some(self.instance.metal.as_ref().map_or(
                 Err(CreateSurfaceError::BackendNotEnabled(Backend::Metal)),
                 |inst| {
@@ -621,7 +595,6 @@ impl Global {
     ) -> Result<SurfaceId, CreateSurfaceError> {
         let surface = Surface {
             presentation: Mutex::new(rank::SURFACE_PRESENTATION, None),
-            info: ResourceInfo::new(&None, None),
             dx12: Some(create_surface_func(
                 self.instance
                     .dx12
@@ -1100,16 +1073,15 @@ impl Global {
                 Ok(adapter) => adapter,
                 Err(_) => break 'error RequestDeviceError::InvalidAdapter,
             };
-            let (device, mut queue) =
+            let (device, queue) =
                 match adapter.create_device_and_queue(desc, self.instance.flags, trace_path) {
                     Ok((device, queue)) => (device, queue),
                     Err(e) => break 'error e,
                 };
-            let (device_id, _) = device_fid.assign(Arc::new(device));
+            let (device_id, _) = device_fid.assign(device);
             resource_log!("Created Device {:?}", device_id);
 
             let device = hub.devices.get(device_id).unwrap();
-            queue.device = Some(device.clone());
 
             let (queue_id, queue) = queue_fid.assign(Arc::new(queue));
             resource_log!("Created Queue {:?}", queue_id);
@@ -1119,8 +1091,8 @@ impl Global {
             return (device_id, queue_id, None);
         };
 
-        let device_id = device_fid.assign_error(desc.label.borrow_or_default());
-        let queue_id = queue_fid.assign_error(desc.label.borrow_or_default());
+        let device_id = device_fid.assign_error();
+        let queue_id = queue_fid.assign_error();
         (device_id, queue_id, Some(error))
     }
 
@@ -1148,7 +1120,7 @@ impl Global {
                 Ok(adapter) => adapter,
                 Err(_) => break 'error RequestDeviceError::InvalidAdapter,
             };
-            let (device, mut queue) = match adapter.create_device_and_queue_from_hal(
+            let (device, queue) = match adapter.create_device_and_queue_from_hal(
                 hal_device,
                 desc,
                 self.instance.flags,
@@ -1157,11 +1129,10 @@ impl Global {
                 Ok(device) => device,
                 Err(e) => break 'error e,
             };
-            let (device_id, _) = devices_fid.assign(Arc::new(device));
+            let (device_id, _) = devices_fid.assign(device);
             resource_log!("Created Device {:?}", device_id);
 
             let device = hub.devices.get(device_id).unwrap();
-            queue.device = Some(device.clone());
 
             let (queue_id, queue) = queues_fid.assign(Arc::new(queue));
             resource_log!("Created Queue {:?}", queue_id);
@@ -1171,8 +1142,8 @@ impl Global {
             return (device_id, queue_id, None);
         };
 
-        let device_id = devices_fid.assign_error(desc.label.borrow_or_default());
-        let queue_id = queues_fid.assign_error(desc.label.borrow_or_default());
+        let device_id = devices_fid.assign_error();
+        let queue_id = queues_fid.assign_error();
         (device_id, queue_id, Some(error))
     }
 }
