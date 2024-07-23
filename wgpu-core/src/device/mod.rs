@@ -4,7 +4,7 @@ use crate::{
     hub::Hub,
     id::{BindGroupLayoutId, PipelineLayoutId},
     resource::{
-        Buffer, BufferAccessError, BufferAccessResult, BufferMapOperation, Resource,
+        Buffer, BufferAccessError, BufferAccessResult, BufferMapOperation, Labeled,
         ResourceErrorIdent,
     },
     snatch::SnatchGuard,
@@ -39,7 +39,6 @@ pub(crate) const ZERO_BUFFER_SIZE: BufferAddress = 512 << 10;
 // See https://github.com/gfx-rs/wgpu/issues/4589. 60s to reduce the chances of this.
 const CLEANUP_WAIT_MS: u32 = 60000;
 
-const IMPLICIT_BIND_GROUP_LAYOUT_ERROR_LABEL: &str = "Implicit BindGroupLayout in the Error State";
 const ENTRYPOINT_FAILURE_ERROR: &str = "The given EntryPoint is Invalid";
 
 pub type DeviceDescriptor<'a> = wgt::DeviceDescriptor<Label<'a>>;
@@ -106,7 +105,7 @@ pub enum RenderPassCompatibilityError {
 
 impl RenderPassContext {
     // Assumes the renderpass only contains one subpass
-    pub(crate) fn check_compatible<T: Resource>(
+    pub(crate) fn check_compatible<T: Labeled>(
         &self,
         other: &Self,
         res: &T,
@@ -365,6 +364,8 @@ fn map_buffer<A: HalApi>(
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(bound(deserialize = "'de: 'static")))]
 pub struct DeviceMismatch {
     pub(super) res: ResourceErrorIdent,
     pub(super) res_device: ResourceErrorIdent,
@@ -389,6 +390,8 @@ impl std::fmt::Display for DeviceMismatch {
 impl std::error::Error for DeviceMismatch {}
 
 #[derive(Clone, Debug, Error)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(bound(deserialize = "'de: 'static")))]
 #[non_exhaustive]
 pub enum DeviceError {
     #[error("{0} is invalid.")]
@@ -434,18 +437,18 @@ pub struct ImplicitPipelineContext {
 }
 
 pub struct ImplicitPipelineIds<'a> {
-    pub root_id: Option<PipelineLayoutId>,
-    pub group_ids: &'a [Option<BindGroupLayoutId>],
+    pub root_id: PipelineLayoutId,
+    pub group_ids: &'a [BindGroupLayoutId],
 }
 
 impl ImplicitPipelineIds<'_> {
     fn prepare<A: HalApi>(self, hub: &Hub<A>) -> ImplicitPipelineContext {
         ImplicitPipelineContext {
-            root_id: hub.pipeline_layouts.prepare(self.root_id).into_id(),
+            root_id: hub.pipeline_layouts.prepare(Some(self.root_id)).into_id(),
             group_ids: self
                 .group_ids
                 .iter()
-                .map(|id_in| hub.bind_group_layouts.prepare(*id_in).into_id())
+                .map(|id_in| hub.bind_group_layouts.prepare(Some(*id_in)).into_id())
                 .collect(),
         }
     }

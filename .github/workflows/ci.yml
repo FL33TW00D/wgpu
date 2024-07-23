@@ -43,7 +43,7 @@ env:
   REPO_MSRV: "1.76"
   # This is the MSRV used by the `wgpu-core`, `wgpu-hal`, and `wgpu-types` crates,
   # to ensure that they can be used with firefox.
-  CORE_MSRV: "1.74"
+  CORE_MSRV: "1.76"
 
   #
   # Environment variables
@@ -150,10 +150,10 @@ jobs:
           cargo -V
 
       # Use special toolchain for rustdoc, see https://github.com/gfx-rs/wgpu/issues/4905
-      # - name: Install Rustdoc Toolchain
-      #   run: |
-      #     rustup toolchain install ${{ env.DOCS_RUST_VERSION }} --no-self-update --profile=minimal --component rust-docs --target ${{ matrix.target }}
-      #     cargo +${{ env.DOCS_RUST_VERSION }} -V
+      - name: Install Rustdoc Toolchain
+        run: |
+          rustup toolchain install ${{ env.DOCS_RUST_VERSION }} --no-self-update --profile=minimal --component rust-docs --target ${{ matrix.target }}
+          cargo +${{ env.DOCS_RUST_VERSION }} -V
 
       - name: disable debug
         shell: bash
@@ -195,11 +195,11 @@ jobs:
           # build for WebGPU
           cargo clippy --target ${{ matrix.target }} --tests --features glsl,spirv,fragile-send-sync-non-atomic-wasm
           cargo clippy --target ${{ matrix.target }} --tests --features glsl,spirv
-          # cargo +${{ env.DOCS_RUST_VERSION }} doc --target ${{ matrix.target }} --no-deps --features glsl,spirv
+          cargo +${{ env.DOCS_RUST_VERSION }} doc --target ${{ matrix.target }} --no-deps --features glsl,spirv
 
           # all features
           cargo clippy --target ${{ matrix.target }} --tests --all-features
-          # cargo +${{ env.DOCS_RUST_VERSION }} doc --target ${{ matrix.target }} --no-deps --all-features
+          cargo +${{ env.DOCS_RUST_VERSION }} doc --target ${{ matrix.target }} --no-deps --all-features
 
       - name: check em
         if: matrix.kind == 'em'
@@ -229,13 +229,15 @@ jobs:
           cargo clippy --target ${{ matrix.target }} --tests --benches --all-features
 
           # build docs
-          # cargo +${{ env.DOCS_RUST_VERSION }} doc --target ${{ matrix.target }} --all-features --no-deps
+          cargo +${{ env.DOCS_RUST_VERSION }} doc --target ${{ matrix.target }} --all-features --no-deps
+      # wgpu-core docs are not feasible due to <https://github.com/gfx-rs/wgpu/issues/4905>
+      #
       # - name: check private item docs
       #   if: matrix.kind == 'native'
       #   shell: bash
       #   run: |
       #     set -e
-
+      #
       #     # wgpu_core package
       #     cargo +${{ env.DOCS_RUST_VERSION }} doc --target ${{ matrix.target }} \
       #           --package wgpu-core \
@@ -568,6 +570,7 @@ jobs:
         if: steps.coverage.outcome == 'success'
         with:
           files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   doctest:
     # runtime is normally 2 minutes
@@ -628,7 +631,7 @@ jobs:
           cargo fmt --manifest-path xtask/Cargo.toml -- --check
 
       - name: Check for typos
-        uses: crate-ci/typos@v1.22.9
+        uses: crate-ci/typos@v1.23.2
 
   check-cts-runner:
     # runtime is normally 2 minutes

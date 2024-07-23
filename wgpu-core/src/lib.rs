@@ -2,6 +2,20 @@
 //! It is designed for integration into browsers, as well as wrapping
 //! into other language-specific user-friendly libraries.
 //!
+#![cfg_attr(
+    not(any(not(doc), wgpu_core_doc)),
+    doc = r#"\
+## Documentation hidden
+
+As a workaround for [an issue in rustdoc](https://github.com/rust-lang/rust/issues/114891)
+that [affects `wgpu-core` documentation builds \
+severely](https://github.com/gfx-rs/wgpu/issues/4905),
+the documentation for `wgpu-core` is empty unless built with
+`RUSTFLAGS="--cfg wgpu_core_doc"`, which may take a very long time.
+"#
+)]
+#![cfg(any(not(doc), wgpu_core_doc))]
+//!
 //! ## Feature flags
 #![doc = document_features::document_features!()]
 //!
@@ -71,6 +85,7 @@ pub mod resource;
 mod snatch;
 pub mod storage;
 mod track;
+mod utils;
 // This is public for users who pre-compile shaders while still wanting to
 // preserve all run-time checks that `wgpu-core` does.
 // See <https://github.com/gfx-rs/wgpu/issues/3103>, after which this can be
@@ -96,14 +111,10 @@ pub type RawString = *const c_char;
 pub type Label<'a> = Option<Cow<'a, str>>;
 
 trait LabelHelpers<'a> {
-    fn borrow_option(&'a self) -> Option<&'a str>;
     fn to_hal(&'a self, flags: wgt::InstanceFlags) -> Option<&'a str>;
-    fn borrow_or_default(&'a self) -> &'a str;
+    fn to_string(&self) -> String;
 }
 impl<'a> LabelHelpers<'a> for Label<'a> {
-    fn borrow_option(&'a self) -> Option<&'a str> {
-        self.as_ref().map(|cow| cow.as_ref())
-    }
     fn to_hal(&'a self, flags: wgt::InstanceFlags) -> Option<&'a str> {
         if flags.contains(wgt::InstanceFlags::DISCARD_HAL_LABELS) {
             return None;
@@ -111,8 +122,8 @@ impl<'a> LabelHelpers<'a> for Label<'a> {
 
         self.as_ref().map(|cow| cow.as_ref())
     }
-    fn borrow_or_default(&'a self) -> &'a str {
-        self.borrow_option().unwrap_or_default()
+    fn to_string(&self) -> String {
+        self.as_ref().map(|cow| cow.to_string()).unwrap_or_default()
     }
 }
 

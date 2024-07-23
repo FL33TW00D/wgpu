@@ -158,7 +158,7 @@ impl super::Device {
                 metal::MTLPrimitiveTopologyClass::Point => true,
                 _ => false,
             },
-            vertex_pulling_transform: stage.vertex_pulling_transform,
+            vertex_pulling_transform: true,
             vertex_buffer_mappings: vertex_buffer_mappings.to_vec(),
         };
 
@@ -370,9 +370,7 @@ impl crate::Device for super::Device {
         })
     }
 
-    unsafe fn unmap_buffer(&self, _buffer: &super::Buffer) -> DeviceResult<()> {
-        Ok(())
-    }
+    unsafe fn unmap_buffer(&self, _buffer: &super::Buffer) {}
     unsafe fn flush_mapped_ranges<I>(&self, _buffer: &super::Buffer, _ranges: I) {}
     unsafe fn invalidate_mapped_ranges<I>(&self, _buffer: &super::Buffer, _ranges: I) {}
 
