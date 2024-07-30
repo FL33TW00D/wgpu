@@ -44,6 +44,7 @@ async fn execute_gpu(numbers: &[f16]) -> Option<Vec<f16>> {
                 label: None,
                 required_features: wgpu::Features::SHADER_F16,
                 required_limits: wgpu::Limits::downlevel_defaults(),
+                memory_hints: wgpu::MemoryHints::default(),
             },
             None,
         )
@@ -102,7 +103,7 @@ async fn execute_gpu_inner(
         label: None,
         layout: None,
         module: &cs_module,
-        entry_point: "main",
+        entry_point: Some("main"),
         compilation_options: Default::default(),
         cache: None,
     });
