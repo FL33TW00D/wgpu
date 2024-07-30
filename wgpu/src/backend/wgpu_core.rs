@@ -1174,7 +1174,7 @@ impl crate::Context for ContextWgpuCore {
             vertex: pipe::VertexState {
                 stage: pipe::ProgrammableStageDescriptor {
                     module: desc.vertex.module.id.into(),
-                    entry_point: Some(Borrowed(desc.vertex.entry_point)),
+                    entry_point: desc.vertex.entry_point.map(Borrowed),
                     constants: Borrowed(desc.vertex.compilation_options.constants),
                     zero_initialize_workgroup_memory: desc
                         .vertex
@@ -1189,7 +1189,7 @@ impl crate::Context for ContextWgpuCore {
             fragment: desc.fragment.as_ref().map(|frag| pipe::FragmentState {
                 stage: pipe::ProgrammableStageDescriptor {
                     module: frag.module.id.into(),
-                    entry_point: Some(Borrowed(frag.entry_point)),
+                    entry_point: frag.entry_point.map(Borrowed),
                     constants: Borrowed(frag.compilation_options.constants),
                     zero_initialize_workgroup_memory: frag
                         .compilation_options
@@ -1234,7 +1234,7 @@ impl crate::Context for ContextWgpuCore {
             layout: desc.layout.map(|l| l.id.into()),
             stage: pipe::ProgrammableStageDescriptor {
                 module: desc.module.id.into(),
-                entry_point: Some(Borrowed(desc.entry_point)),
+                entry_point: desc.entry_point.map(Borrowed),
                 constants: Borrowed(desc.compilation_options.constants),
                 zero_initialize_workgroup_memory: desc
                     .compilation_options
@@ -1651,7 +1651,7 @@ impl crate::Context for ContextWgpuCore {
     }
 
     fn buffer_drop(&self, buffer: &Self::BufferId, _buffer_data: &Self::BufferData) {
-        wgc::gfx_select!(buffer => self.0.buffer_drop(*buffer, false))
+        wgc::gfx_select!(buffer => self.0.buffer_drop(*buffer))
     }
 
     fn texture_destroy(&self, texture: &Self::TextureId, _texture_data: &Self::TextureData) {
@@ -1660,7 +1660,7 @@ impl crate::Context for ContextWgpuCore {
     }
 
     fn texture_drop(&self, texture: &Self::TextureId, _texture_data: &Self::TextureData) {
-        wgc::gfx_select!(texture => self.0.texture_drop(*texture, false))
+        wgc::gfx_select!(texture => self.0.texture_drop(*texture))
     }
 
     fn texture_view_drop(
@@ -1668,7 +1668,7 @@ impl crate::Context for ContextWgpuCore {
         texture_view: &Self::TextureViewId,
         __texture_view_data: &Self::TextureViewData,
     ) {
-        let _ = wgc::gfx_select!(*texture_view => self.0.texture_view_drop(*texture_view, false));
+        let _ = wgc::gfx_select!(*texture_view => self.0.texture_view_drop(*texture_view));
     }
 
     fn sampler_drop(&self, sampler: &Self::SamplerId, _sampler_data: &Self::SamplerData) {
@@ -1975,7 +1975,7 @@ impl crate::Context for ContextWgpuCore {
                 &encoder_data.error_sink,
                 cause,
                 desc.label,
-                "CommandEncoder::begin_compute_pass",
+                "CommandEncoder::begin_render_pass",
             );
         }
 

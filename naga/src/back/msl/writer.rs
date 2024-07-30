@@ -1071,43 +1071,6 @@ impl<W: Write> Writer<W> {
         value: Handle<crate::Expression>,
         context: &StatementContext,
     ) -> BackendResult {
-        match context.expression.policies.image_store {
-            proc::BoundsCheckPolicy::Restrict => {
-                // We don't have a restricted level value, because we don't
-                // support writes to mipmapped textures.
-                debug_assert!(address.level.is_none());
-
-                write!(self.out, "{level}")?;
-                self.put_expression(image, &context.expression, false)?;
-                write!(self.out, ".write(")?;
-                self.put_expression(value, &context.expression, true)?;
-                write!(self.out, ", ")?;
-                self.put_restricted_texel_address(image, address, &context.expression)?;
-                writeln!(self.out, ");")?;
-            }
-            proc::BoundsCheckPolicy::ReadZeroSkipWrite => {
-                write!(self.out, "{level}if (")?;
-                self.put_image_access_bounds_check(image, address, &context.expression)?;
-                writeln!(self.out, ") {{")?;
-                self.put_unchecked_image_store(level.next(), image, address, value, context)?;
-                writeln!(self.out, "{level}}}")?;
-            }
-            proc::BoundsCheckPolicy::Unchecked => {
-                self.put_unchecked_image_store(level, image, address, value, context)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn put_unchecked_image_store(
-        &mut self,
-        level: back::Level,
-        image: Handle<crate::Expression>,
-        address: &TexelAddress,
-        value: Handle<crate::Expression>,
-        context: &StatementContext,
-    ) -> BackendResult {
         write!(self.out, "{level}")?;
         self.put_expression(image, &context.expression, false)?;
         write!(self.out, ".write(")?;
@@ -1242,7 +1205,7 @@ impl<W: Write> Writer<W> {
         // with different precedences from applying earlier.
         write!(self.out, "(")?;
 
-        // Cycle trough all the components of the vector
+        // Cycle through all the components of the vector
         for index in 0..size {
             let component = back::COMPONENTS[index];
             // Write the addition to the previous product
@@ -1897,8 +1860,8 @@ impl<W: Write> Writer<W> {
                     Mf::ReverseBits => "reverse_bits",
                     Mf::ExtractBits => "",
                     Mf::InsertBits => "",
-                    Mf::FindLsb => "",
-                    Mf::FindMsb => "",
+                    Mf::FirstTrailingBit => "",
+                    Mf::FirstLeadingBit => "",
                     // data packing
                     Mf::Pack4x8snorm => "pack_float_to_snorm4x8",
                     Mf::Pack4x8unorm => "pack_float_to_unorm4x8",
@@ -1942,7 +1905,7 @@ impl<W: Write> Writer<W> {
                         self.put_expression(arg1.unwrap(), context, false)?;
                         write!(self.out, ")")?;
                     }
-                    Mf::FindLsb => {
+                    Mf::FirstTrailingBit => {
                         let scalar = context.resolve_type(arg).scalar().unwrap();
                         let constant = scalar.width * 8 + 1;
 
@@ -1950,7 +1913,7 @@ impl<W: Write> Writer<W> {
                         self.put_expression(arg, context, true)?;
                         write!(self.out, ") + 1) % {constant}) - 1)")?;
                     }
-                    Mf::FindMsb => {
+                    Mf::FirstLeadingBit => {
                         let inner = context.resolve_type(arg);
                         let scalar = inner.scalar().unwrap();
                         let constant = scalar.width * 8 - 1;
@@ -2724,7 +2687,7 @@ impl<W: Write> Writer<W> {
                             }
                         }
                     }
-                    crate::MathFunction::FindMsb
+                    crate::MathFunction::FirstLeadingBit
                     | crate::MathFunction::Pack4xI8
                     | crate::MathFunction::Pack4xU8
                     | crate::MathFunction::Unpack4xI8

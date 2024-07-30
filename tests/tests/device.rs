@@ -107,7 +107,7 @@ static REQUEST_DEVICE_ERROR_MESSAGE_NATIVE: GpuTestConfiguration =
 async fn request_device_error_message() {
     // Not using initialize_test() because that doesn't let us catch the error
     // nor .await anything
-    let (_instance, adapter, _surface_guard) = wgpu_test::initialize_adapter(0).await;
+    let (_instance, adapter, _surface_guard) = wgpu_test::initialize_adapter(0, false).await;
 
     let device_error = adapter
         .request_device(
@@ -533,7 +533,7 @@ static DEVICE_DESTROY_THEN_MORE: GpuTestConfiguration = GpuTestConfiguration::ne
                         layout: None,
                         vertex: wgpu::VertexState {
                             module: &shader_module,
-                            entry_point: "",
+                            entry_point: Some(""),
                             compilation_options: Default::default(),
                             buffers: &[],
                         },
@@ -557,7 +557,7 @@ static DEVICE_DESTROY_THEN_MORE: GpuTestConfiguration = GpuTestConfiguration::ne
                         label: None,
                         layout: None,
                         module: &shader_module,
-                        entry_point: "",
+                        entry_point: None,
                         compilation_options: Default::default(),
                         cache: None,
                     });
@@ -574,7 +574,7 @@ static DEVICE_DESTROY_THEN_MORE: GpuTestConfiguration = GpuTestConfiguration::ne
                         label: None,
                         layout: None,
                         module: &shader_module,
-                        entry_point: "",
+                        entry_point: None,
                         compilation_options: Default::default(),
                         cache: None,
                     });
@@ -823,7 +823,7 @@ static DIFFERENT_BGL_ORDER_BW_SHADER_AND_API: GpuTestConfiguration = GpuTestConf
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 fragment: Some(wgpu::FragmentState {
                     module: &trivial_shaders_with_some_reversed_bindings,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgt::ColorTargetState {
                         format: wgt::TextureFormat::Bgra8Unorm,
@@ -837,7 +837,7 @@ static DIFFERENT_BGL_ORDER_BW_SHADER_AND_API: GpuTestConfiguration = GpuTestConf
                 label: None,
                 vertex: wgpu::VertexState {
                     module: &trivial_shaders_with_some_reversed_bindings,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
                     buffers: &[],
                 },

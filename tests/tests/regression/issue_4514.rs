@@ -1,21 +1,23 @@
-use wgpu_test::{gpu_test, image, GpuTestConfiguration, TestingContext};
+use wgpu_test::{gpu_test, image, GpuTestConfiguration, TestParameters, TestingContext};
 
-struct Rect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
+/// FXC and potentially some glsl consumers have a bug when handling switch statements on a constant
+/// with just a default case. (not sure if the constant part is relevant)
+/// See <https://github.com/gfx-rs/wgpu/issues/4514>.
+///
+/// This test will fail on Dx12 with FXC if this issue is not worked around.
+///
+/// So far no specific buggy glsl consumers have been identified and it isn't known whether the
+/// bug is avoided there.
+#[gpu_test]
+static DEGENERATE_SWITCH: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(TestParameters::default().force_fxc(true))
+    .run_async(|ctx| async move { test_impl(&ctx).await });
 
-const TEXTURE_HEIGHT: u32 = 2;
-const TEXTURE_WIDTH: u32 = 2;
-const BUFFER_SIZE: usize = (TEXTURE_WIDTH * TEXTURE_HEIGHT * 4) as usize;
+async fn test_impl(ctx: &TestingContext) {
+    const TEXTURE_HEIGHT: u32 = 2;
+    const TEXTURE_WIDTH: u32 = 2;
+    const BUFFER_SIZE: usize = (TEXTURE_WIDTH * TEXTURE_HEIGHT * 4) as usize;
 
-async fn scissor_test_impl(
-    ctx: &TestingContext,
-    scissor_rect: Rect,
-    expected_data: [u8; BUFFER_SIZE],
-) {
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Offscreen texture"),
         size: wgpu::Extent3d {
@@ -34,7 +36,7 @@ async fn scissor_test_impl(
 
     let shader = ctx
         .device
-        .create_shader_module(wgpu::include_wgsl!("solid_white.wgsl"));
+        .create_shader_module(wgpu::include_wgsl!("issue_4514.wgsl"));
 
     let pipeline = ctx
         .device
@@ -76,6 +78,7 @@ async fn scissor_test_impl(
                     view: &texture_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
+                        // Important: this isn't the color expected below
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.0,
                             g: 0.0,
@@ -90,86 +93,14 @@ async fn scissor_test_impl(
                 occlusion_query_set: None,
             });
             render_pass.set_pipeline(&pipeline);
-            render_pass.set_scissor_rect(
-                scissor_rect.x,
-                scissor_rect.y,
-                scissor_rect.width,
-                scissor_rect.height,
-            );
             render_pass.draw(0..3, 0..1);
         }
         readback_buffer.copy_from(&ctx.device, &mut encoder, &texture);
         ctx.queue.submit(Some(encoder.finish()));
     }
+
+    let expected_data = [255; BUFFER_SIZE];
     readback_buffer
         .assert_buffer_contents(ctx, &expected_data)
         .await;
 }
-
-#[gpu_test]
-static SCISSOR_TEST_FULL_RECT: GpuTestConfiguration =
-    GpuTestConfiguration::new().run_async(|ctx| async move {
-        scissor_test_impl(
-            &ctx,
-            Rect {
-                x: 0,
-                y: 0,
-                width: TEXTURE_WIDTH,
-                height: TEXTURE_HEIGHT,
-            },
-            [255; BUFFER_SIZE],
-        )
-        .await
-    });
-
-#[gpu_test]
-static SCISSOR_TEST_EMPTY_RECT: GpuTestConfiguration =
-    GpuTestConfiguration::new().run_async(|ctx| async move {
-        scissor_test_impl(
-            &ctx,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0,
-            },
-            [0; BUFFER_SIZE],
-        )
-        .await;
-    });
-
-#[gpu_test]
-static SCISSOR_TEST_EMPTY_RECT_WITH_OFFSET: GpuTestConfiguration = GpuTestConfiguration::new()
-    .run_async(|ctx| async move {
-        scissor_test_impl(
-            &ctx,
-            Rect {
-                x: TEXTURE_WIDTH / 2,
-                y: TEXTURE_HEIGHT / 2,
-                width: 0,
-                height: 0,
-            },
-            [0; BUFFER_SIZE],
-        )
-        .await
-    });
-
-#[gpu_test]
-static SCISSOR_TEST_CUSTOM_RECT: GpuTestConfiguration =
-    GpuTestConfiguration::new().run_async(|ctx| async move {
-        let mut expected_result = [0; BUFFER_SIZE];
-        expected_result[((3 * BUFFER_SIZE) / 4)..][..BUFFER_SIZE / 4]
-            .copy_from_slice(&[255; BUFFER_SIZE / 4]);
-
-        scissor_test_impl(
-            &ctx,
-            Rect {
-                x: TEXTURE_WIDTH / 2,
-                y: TEXTURE_HEIGHT / 2,
-                width: TEXTURE_WIDTH / 2,
-                height: TEXTURE_HEIGHT / 2,
-            },
-            expected_result,
-        )
-        .await;
-    });

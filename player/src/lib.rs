@@ -1,6 +1,5 @@
-/*! This is a player library for WebGPU traces.
- *
-!*/
+//! This is a player library for WebGPU traces.
+
 #![cfg(not(target_arch = "wasm32"))]
 #![warn(unsafe_op_in_unsafe_fn)]
 
@@ -158,7 +157,7 @@ impl GlobalPlay for wgc::global::Global {
                 self.buffer_destroy::<A>(id).unwrap();
             }
             Action::DestroyBuffer(id) => {
-                self.buffer_drop::<A>(id, true);
+                self.buffer_drop::<A>(id);
             }
             Action::CreateTexture(id, desc) => {
                 let (_, error) = self.device_create_texture::<A>(device, &desc, Some(id));
@@ -170,7 +169,7 @@ impl GlobalPlay for wgc::global::Global {
                 self.texture_destroy::<A>(id).unwrap();
             }
             Action::DestroyTexture(id) => {
-                self.texture_drop::<A>(id, true);
+                self.texture_drop::<A>(id);
             }
             Action::CreateTextureView {
                 id,
@@ -183,7 +182,7 @@ impl GlobalPlay for wgc::global::Global {
                 }
             }
             Action::DestroyTextureView(id) => {
-                self.texture_view_drop::<A>(id, true).unwrap();
+                self.texture_view_drop::<A>(id).unwrap();
             }
             Action::CreateSampler(id, desc) => {
                 let (_, error) = self.device_create_sampler::<A>(device, &desc, Some(id));
@@ -331,8 +330,7 @@ impl GlobalPlay for wgc::global::Global {
                     self.queue_write_buffer::<A>(device.into_queue_id(), id, range.start, &bin)
                         .unwrap();
                 } else {
-                    self.device_wait_for_buffer::<A>(device, id).unwrap();
-                    self.device_set_buffer_sub_data::<A>(device, id, range.start, &bin[..size])
+                    self.device_set_buffer_data::<A>(id, range.start, &bin[..size])
                         .unwrap();
                 }
             }
